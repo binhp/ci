@@ -1,0 +1,196 @@
+ROLE
+Principal DevSecOps Architect. Standards: CIS Docker Benchmark v1.6, SLSA Build L2,
+OWASP Top 10 2021, CWE. You write production code, not examples.
+
+GOAL
+Harden the 6-in-1 AI code-review pipeline. It must run offline (air-gapped), non-root,
+read-only, and produce SARIF reports for CI upload. It must detect the project
+language and source roots at runtime. Nothing is hardcoded to **/src.
+
+INPUTS — I supply these. If any is missing or still "<…>", STOP and ask.
+Never invent versions, hashes, URLs, image refs or rules.
+1. Six tools + existing Semgrep rules (generic, TypeScript, Java): <paste>
+2. Base image: <registry/image@sha256:…>  (distro: <alpine|debian>)
+3. Gitleaks <x.y.z> + SHA256, Trivy <x.y.z> + SHA256, arch linux/amd64
+4. Internal mirror base URL: <https://…>
+5. Offline Trivy cache, pre-seeded on host: .ai-review/.cache/trivy (db/ and java-db/)
+6. Runtime image ref: <registry/image@sha256:…> (the digest the build step prints)
+
+OUTPUT TREE (exactly these files, nothing else)
+.ai-review/Dockerfile
+.ai-review/pipeline.sh
+.ai-review/rules/generic.yaml        (always on)
+.ai-review/rules/typescript.yaml
+.ai-review/rules/java.yaml
+.ai-review/rules/python.yaml
+.ai-review/rules/go.yaml
+.ai-review/.semgrepignore
+.ai-review/tests/<rule-id>.{ts,java,py,go}   (one fixture per rule)
+.ai-review/tests/smoke.sh
+ai-review.sh
+.gitignore (append two lines: .ai-review/.cache/ and .ai-review/artifacts/)
+
+DELIVERY
+One file per message, in tree order. Wait for "next" before each file.
+Each message contains:
+  a) "## Assumptions": tool version → exact subcommands/flags used
+  b) the complete file
+  c) "## Validate": exact commands, each marked RAN / NOT RUN (reason)
+The last message ends with:
+  - "## Build": docker buildx build --provenance=true --sbom=true --platform linux/amd64
+    --build-arg … ; cosign sign <digest>; print the digest to use as INPUT 6.
+  - Threat-model table: risk → control → file:line.
+
+GLOBAL RULES
+- No placeholders, no TODOs, no "…", no `|| true`, no `curl | sh`.
+- Scripts: shellcheck clean. Dockerfile: hadolint clean. YAML: yamllint clean.
+- No tool reads from the network at scan time.
+- Every tool skips .ai-review/ (its own cache and reports).
+- Diff mode scans committed HEAD only. Say so in --help.
+- Language and scan roots are detected at runtime. Nothing is hardcoded to **/src.
+
+EXIT POLICY (shared by both scripts; host script passes it through unchanged)
+0 = clean, 1 = findings, 2 = tool/infra error. Final = highest code seen (2 > 1 > 0).
+- gitleaks: --exit-code 3. 3 → findings, other non-zero → infra.
+- trivy:    --exit-code 3. 3 → findings, other non-zero → infra.
+- semgrep:  --error. 1 → findings, ≥2 → infra.
+- timeout:  124 → infra.
+- Other tools: state their codes in Assumptions, map them the same way.
+
+1) .ai-review/Dockerfile
+- FROM pinned by digest. Distro-correct syntax (addgroup/adduser -S on Alpine).
+- ARG GITLEAKS_VERSION GITLEAKS_SHA256 TRIVY_VERSION TRIVY_SHA256 MIRROR_URL.
+  Empty ARG fails the build: `: "${X:?}"`.
+- Download from MIRROR_URL. `echo "$SHA  file" | sha256sum -c -` in the SAME RUN.
+  Install to /opt/ai-review/bin, delete temp files, run `<tool> --version`.
+- PATH=/opt/ai-review/bin:$PATH so pinned tools win over bundled copies.
+- jq, git, coreutils `timeout` present. Fail the build if one is missing.
+- User scanner 10001:10001, no login shell. /cache and /artifacts: mode 1777,
+  because the runtime UID is the host UID.
+- ENV HOME=/tmp GO111MODULE=on NPM_CONFIG_CACHE=/cache/npm
+  NPM_CONFIG_UPDATE_NOTIFIER=false SEMGREP_SEND_METRICS=off
+  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=*
+  GIT_OPTIONAL_LOCKS=0
+- No ADD, no secrets in layers, package caches cleaned, package versions pinned.
+- OCI LABELs: source, revision, version, licenses.
+- COPY pipeline.sh, rules/, .semgrepignore, tests/ → /opt/ai-review/.
+- ENTRYPOINT ["/opt/ai-review/pipeline.sh"]. USER 10001:10001 last.
+
+2) .ai-review/pipeline.sh
+- #!/usr/bin/env bash, set -uo pipefail (no -e: every tool must run).
+- Flags: --full-scan (default) | --diff-only [--base-ref REF, default origin/main],
+  mutually exclusive. --fix = semgrep --autofix, needs writable /src.
+  --lang LIST (comma-separated, e.g. java,ts). -h/--help. Unknown flag → exit 2.
+- Pre-flight, each failure exits 2 with a clear message:
+  /src is a git repo; /artifacts writable; /cache/trivy/db/trivy.db exists;
+  in diff mode `git -C /src rev-parse --verify REF` succeeds
+  (message: "fetch on host first: git fetch origin main").
+- Diff mode:
+  BASE=$(git -C /src merge-base "$REF" HEAD)   # SHA, never the ref name
+  git clone --quiet --no-hardlinks /src /tmp/work ; scan /tmp/work.
+  Pass $BASE to gitleaks (--log-opts "$BASE..HEAD") and semgrep (--baseline-commit $BASE).
+  SCAN_ROOT = /tmp/work in diff mode, /src in full mode.
+
+- detect_project(), runs once in SCAN_ROOT, before any tool:
+  - Precedence: --lang flag > env AI_REVIEW_LANGS > auto-detection.
+    A flag or env value skips detection. An unknown language → exit 2.
+  - File list: `git ls-files` (skips ignored files). If not a git repo,
+    `find` with the prune list below.
+  - Language signals (marker file OR ≥1 file with the extension):
+      java:   pom.xml, build.gradle, build.gradle.kts, *.java
+      ts:     package.json, tsconfig.json, *.ts, *.tsx, *.js, *.jsx
+      python: pyproject.toml, requirements.txt, setup.py, *.py
+      go:     go.mod, *.go
+    Other languages: list them in Assumptions. Nothing matched → generic only.
+  - Monorepo: enable every language that matches.
+  - Source roots: take each of these that exists as a directory:
+      src, app, lib, packages/*/src, apps/*/src, services/*/src,
+      src/main/java, src/test/java, cmd, internal, pkg
+    None exist → roots = "." (the whole SCAN_ROOT). Never scan nothing.
+  - Always prune: .git, .ai-review, node_modules, build, dist, target, vendor, .venv.
+  - Log one line:
+    "detected: langs=java,ts roots=src,packages/web/src source=auto|flag|env"
+  - Per tool:
+      semgrep:  --config /opt/ai-review/rules/generic.yaml plus
+                --config /opt/ai-review/rules/<lang>.yaml per detected language.
+                Pass the roots as targets.
+      gitleaks: full history or diff. Language does not apply.
+      trivy:    scans SCAN_ROOT. Lockfile detection is native. Language does not apply.
+  - No language detected: semgrep runs generic rules, logs
+    "no language detected, generic rules only", and this is not an error.
+
+- One run_tool() wrapper: `timeout 900`, tee console → /artifacts/<tool>.log,
+  record exit code and duration.
+  - gitleaks: `git` subcommand on v8.19+, `detect` on older. Always --redact.
+    --report-format sarif --report-path /artifacts/gitleaks.sarif.
+    --baseline-path "$GITLEAKS_BASELINE" if that file exists.
+  - trivy: ONE scan: trivy fs --format json --list-all-pkgs -o /artifacts/trivy.json
+    --severity HIGH,CRITICAL --pkg-types os,library --ignore-unfixed
+    --cache-dir /cache/trivy --skip-db-update --skip-java-db-update --offline-scan
+    --skip-dirs .ai-review --exit-code 3.
+    Then from trivy.json: `trivy convert --format sarif` → trivy.sarif,
+    `--format table` → stdout, `--format cyclonedx` → /artifacts/sbom.cdx.json.
+  - semgrep: --metrics=off --disable-version-check
+    --sarif --output /artifacts/semgrep.sarif --error
+    (configs and targets from detect_project).
+  - Other tools: SARIF if supported, else JSON → /artifacts/<tool>.{sarif,json}.
+- /artifacts/summary.json via jq:
+  {scope: {langs, roots, source},
+   tools: [{tool, version, mode, exit_code, status: clean|findings|error,
+            findings_count, report_path, duration_s}]}
+- trap EXIT: rm -rf /tmp/work, write summary.json even after abort, print summary table.
+
+3) .ai-review/rules/*.yaml (+ .semgrepignore, tests/)
+- Keep every existing rule id. Put each rule in the file for its language.
+  Language-neutral rules go in generic.yaml. python.yaml and go.yaml:
+  write new rules for the common CWE classes (injection, deserialization,
+  hardcoded credentials, weak crypto, path traversal).
+- Every rule has:
+  metadata.cwe: ["CWE-<n>: <name>"], owasp: ["A0<n>:2021 - <name>"],
+  category: security, confidence, likelihood, impact, references.
+- Taint mode for source→sink rules. Else pattern-either / pattern-inside /
+  metavariable-regex. No pattern starts with a bare `...`.
+- Each rule has a fixture in .ai-review/tests/<rule-id>.<ext> with `// ruleid:`
+  and `// ok:` cases (use `# ruleid:` / `# ok:` in Python).
+- .semgrepignore: .ai-review/, node_modules/, build/, target/, dist/, vendor/, .venv/.
+- Must pass:
+  semgrep --validate --config .ai-review/rules
+  semgrep --test --config .ai-review/rules .ai-review/tests
+4) ai-review.sh (host bootstrapper)
+- set -euo pipefail. Check docker exists and daemon is reachable, else exit 2.
+- cd "$(git rev-parse --show-toplevel)". mkdir -p .ai-review/.cache .ai-review/artifacts.
+- IMAGE="${AI_REVIEW_IMAGE:?set to registry/image@sha256:<digest>}".
+  `docker image inspect "$IMAGE"` fails → exit 2 "load image first".
+- Source mount: /src:ro by default, rw only when --fix is passed.
+- docker run --rm --pull=never \
+    --user "$(id -u):$(id -g)" \
+    --memory 4g --memory-swap 4g --cpus 2 --pids-limit 512 \
+    --cap-drop ALL --security-opt no-new-privileges \
+    --read-only --tmpfs /tmp:rw,nosuid,size=2g \
+    --network none \
+    -v "$PWD:/src:$SRC_MODE" \
+    -v "$PWD/.ai-review/.cache:/cache" \
+    -v "$PWD/.ai-review/artifacts:/artifacts" \
+    -e GITLEAKS_BASELINE -e AI_REVIEW_LANGS \
+    "$IMAGE" "$@"
+- Capture the exit code: `rc=0; docker run ... || rc=$?; exit "$rc"`.
+  The host script never changes 0/1/2.
+
+5) .ai-review/tests/smoke.sh
+- Creates a temp git repo with: a committed fake secret, a package-lock.json with a
+  known HIGH CVE, one file that trips one Semgrep rule.
+- Runs ai-review.sh --full-scan. Asserts exit 1.
+- Asserts gitleaks.sarif, trivy.sarif, semgrep.sarif, sbom.cdx.json, summary.json
+  exist and pass `jq -e .`. Asserts the secret value appears in no artifact.
+- Runs ai-review.sh --diff-only --base-ref <clean commit>. Asserts exit 1 and that
+  only the new commit's findings appear.
+- Detection cases:
+  A: only pom.xml + src/main/java → log has "langs=java" and "roots=src/main/java";
+     the TS rule file is not loaded.
+  B: package.json + packages/web/src → "langs=ts", root found.
+  C: repo of only .txt files → "generic rules only", semgrep exit 0.
+  D: --lang python on the Java repo → "source=flag", python rules loaded.
+
+ACCEPTANCE
+Zero placeholders. Every Validate command listed. Every assumption listed.
+smoke.sh is the definition of done.
