@@ -1,45 +1,136 @@
 ROLE
 Principal DevSecOps Architect. Standards: CIS Docker Benchmark v1.6, SLSA Build L2,
-OWASP Top 10 2021, CWE. You write production code, not examples.
+OWASP Top 10 2025 (and 2021 for old rule ids), OWASP ASVS 5.0, OWASP MASVS (ios/react-native),
+CWE Top 25 (2025), NIST SSDF SP 800-218, OWASP Top 10 for LLM Applications 2025.
+Write production code, not examples.
 
 GOAL
-Harden the 6-in-1 AI code-review pipeline. It must run offline (air-gapped), non-root,
-read-only, and produce SARIF reports for CI upload. It must detect the project
-language and source roots at runtime. Nothing is hardcoded to **/src.
+Harden the 6-in-1 AI code-review pipeline.
+SUPPORTED STACKS: java, js (JavaScript and TypeScript, Node and browser), ios (Swift,
+SwiftPM, CocoaPods), python, go. react is a sub-profile of js (detected from package.json, section 4f).
+Java, js and react get the deepest rules (sections 4d, 4e, 4f).
+ios, python and go get the baseline in 4a-4c.
+The pipeline verifies AI-generated code on two axes: SECURITY (secrets, CVEs, SAST) and QUALITY
+(lint, Sonar-style rules, complexity, SOLID, DRY, tests). A quality or guardrail
+violation fails the run like a finding.
+The pipeline must run offline (air-gapped), non-root, read-only. It must produce SARIF reports for CI
+upload. It must detect the project language and source roots at runtime. Do not hardcode **/src.
 
-INPUTS — I supply these. If any is missing or still "<…>", STOP and ask.
-Never invent versions, hashes, URLs, image refs or rules.
-1. Six tools + existing Semgrep rules (generic, TypeScript, Java): <paste>
-2. Base image: <registry/image@sha256:…>  (distro: <alpine|debian>)
-3. Gitleaks <x.y.z> + SHA256, Trivy <x.y.z> + SHA256, arch linux/amd64
-4. Internal mirror base URL: <https://…>
-5. Offline Trivy cache, pre-seeded on host: .ai-review/.cache/trivy (db/ and java-db/)
-6. Runtime image ref: <registry/image@sha256:…> (the digest the build step prints)
+INPUTS — NONE REQUIRED. The agent resolves every version, URL, digest and checksum itself.
+It queries upstream at generation time (rule R below). I may supply OPTIONAL overrides.
+A missing override is never a reason to stop or ask.
+Optional overrides (defaults as shown):
+  - distro: alpine | debian-slim            (default: debian-slim; JDK/Node/SwiftLint need glibc)
+  - mirror base URL                         (default: none = upstream; with a mirror, fetch the same
+                                             files from it and re-verify)
+  - pin overrides: TOOL=x.y.z               (default: latest stable passing the cooldown)
+  - release cooldown days                   (default: 7)
+  - quality thresholds                      (default: section 4c)
+Tools to resolve (the agent finds the official release source of each):
+  secrets: gitleaks. deps/SBOM: trivy. SAST: semgrep (pip, hash-pinned) + rules in this repo.
+  docs: vale, markdownlint-cli2 (+ lychee optional, offline link check).
+  js: eslint + plugins, typescript-eslint, typescript, dependency-cruiser, jscpd (npm).
+  java: PMD, Checkstyle, SpotBugs + find-sec-bugs + fb-contrib, Error Prone + NullAway,
+  ArchUnit, Spotless (Maven Central). ios: SwiftLint, SwiftFormat (GitHub releases).
+  python: ruff, bandit, mypy (PyPI). go: golangci-lint. CI: zizmor, actionlint.
+  Do not use SonarQube/SonarScanner (needs a server). Use the Sonar-equivalent rules in section 4.
+
+R) AUTO-RESOLUTION (replaces all manual input; the agent runs it, I do not)
+Deliver .ai-review/resolve.sh (host, needs network, run once and on a schedule). It writes
+.ai-review/versions.lock.json (committed, reviewed in a PR like any dependency bump).
+Dockerfile build args, ai-review.sh and README READ the lock file.
+- Latest version: query the official source. Do not use a search engine or memory.
+    GitHub releases:  `gh api repos/<owner>/<repo>/releases/latest` (stable only: skip
+                      draft/prerelease; apply the cooldown by `published_at`).
+    npm:              `npm view <pkg> version time --json`.   PyPI: `/pypi/<pkg>/json`.
+    Maven Central:    `maven-metadata.xml` (release, not SNAPSHOT/alpha/beta/rc).
+    Go tools:         GitHub releases.
+  Skip a version younger than the cooldown. Use the previous stable and log it.
+- URL: build it from the release asset list for linux/amd64 (and linux/arm64 if asked).
+  Do not use a hand-written template. If an asset is missing, exit 2 with the asset names found.
+- Verify all of these. Each failure exits 2 (never a warning, never `|| true`):
+    1. SHA256 of the downloaded file equals the checksum published by the release (checksums
+       file) AND equals GitHub's asset `digest` field when the API returns one.
+    2. Signature or attestation, only where upstream publishes one (cosign
+       `verify-blob` / `gh attestation verify`). State per tool in Assumptions: "signature
+       verified" or "upstream publishes none; integrity only". Do not claim more.
+    3. `<tool> --version` output equals the resolved version.
+    4. Archive has no path traversal (`tar -tf` check) before extraction.
+    5. For npm/PyPI/Maven: resolve exact versions. Then write the lockfile with integrity
+       hashes (`npm ci`-compatible package-lock.json, `pip-compile --generate-hashes`,
+       Maven checksums via `--strict-checksums`). Install from the lock with
+       `--ignore-scripts` / `--require-hashes`.
+    6. Release is not yanked/deprecated. The project has no open critical advisory for
+       that version (query the GitHub advisory API; if it fails, exit 2).
+- Base image: resolve the newest patch tag of the chosen distro line (e.g. debian
+  `stable-slim`) to its digest with `docker buildx imagetools inspect` (or `crane digest`).
+  Write `image@sha256:…` into the lock file. If the image has a cosign signature, verify it.
+- Trivy DB: run `trivy image --download-db-only` and `--download-java-db-only` into
+  .ai-review/.cache/trivy. Record DB `UpdatedAt` in the lock file. If the DB is older than
+  7 days, fail the later scan (exit 2) (override: AI_REVIEW_MAX_DB_AGE_DAYS).
+- Runtime image ref: after `docker buildx build`, write the digest to
+  .ai-review/image.digest. ai-review.sh reads AI_REVIEW_IMAGE, else that file. Nobody types it.
+- Idempotent: if upstream is unchanged, two runs of resolve.sh produce an identical lock
+  file. Output a human diff of changes (old → new version, published_at, checksum).
+- Failure handling: on network error, rate limit, missing checksum or mismatch, exit 2 with the
+  URL and the reason. Retry 3 times with backoff on 5xx/429 only.
+- Do not invent a value. Do not write a value not obtained from a live query in this run.
 
 OUTPUT TREE (exactly these files, nothing else)
+.ai-review/resolve.sh               (host: resolves + verifies latest versions)
+.ai-review/build.sh                 (host: buildx from the lock file, cosign sign, writes image.digest)
+.ai-review/versions.lock.json       (generated by resolve.sh, committed)
+.ai-review/image.digest             (generated by the build, git-ignored)
 .ai-review/Dockerfile
 .ai-review/pipeline.sh
+.ai-review/guardrails.sh
+.ai-review/quality-gate.json
+.ai-review/lint/eslint.config.mjs
+.ai-review/lint/ruff.toml
+.ai-review/lint/golangci.yml
+.ai-review/lint/.swiftlint.yml
+.ai-review/lint/.swiftformat
+.ai-review/lint/pmd-ruleset.xml
+.ai-review/lint/checkstyle.xml
+.ai-review/lint/jscpd.json
+.ai-review/lint/vale.ini
+.ai-review/lint/styles/STE/*.yml     (STE-lite rules, section 4g)
+.ai-review/lint/markdownlint.json
+.ai-review/tests/docs/               (one good + one bad fixture per docs rule)
+.ai-review/lint/tsconfig.base.json
+.ai-review/lint/depcruise.cjs
+.ai-review/lint/archunit/            (default ArchUnit rule set, Java)
+.ai-review/rules/quality.yaml        (always on: SOLID, DRY, maintainability, AI-slop)
 .ai-review/rules/generic.yaml        (always on)
-.ai-review/rules/typescript.yaml
+.ai-review/rules/javascript.yaml     (JS and TS)
+.ai-review/rules/react.yaml          (loaded when react is detected, on top of javascript.yaml)
 .ai-review/rules/java.yaml
+.ai-review/rules/swift.yaml           (iOS)
 .ai-review/rules/python.yaml
 .ai-review/rules/go.yaml
 .ai-review/.semgrepignore
-.ai-review/tests/<rule-id>.{ts,java,py,go}   (one fixture per rule)
+.ai-review/tests/<rule-id>.{js,ts,tsx,jsx,java,swift,py,go}   (one fixture per rule)
+.ai-review/tests/guardrails.sh        (one failing + one passing case per guardrail)
 .ai-review/tests/smoke.sh
-ai-review.sh
-.gitignore (append two lines: .ai-review/.cache/ and .ai-review/artifacts/)
+ai-review.sh                          (also implements --init-ci, section 9)
+.ai-review/ci/github.yml              (template, SHA pins filled by resolve.sh)
+.ai-review/ci/gitlab.yml
+.ai-review/ci/generic.sh              (any other CI: Jenkins, Bitbucket, Azure, CircleCI, Buildkite)
+.gitignore (append three lines: .ai-review/.cache/, .ai-review/artifacts/, .ai-review/image.digest)
 
 DELIVERY
-One file per message, in tree order. Wait for "next" before each file.
+Send one file per message, in tree order. Wait for "next" before each file.
 Each message contains:
   a) "## Assumptions": tool version → exact subcommands/flags used
   b) the complete file
   c) "## Validate": exact commands, each marked RAN / NOT RUN (reason)
 The last message ends with:
   - "## Build": docker buildx build --provenance=true --sbom=true --platform linux/amd64
-    --build-arg … ; cosign sign <digest>; print the digest to use as INPUT 6.
-  - Threat-model table: risk → control → file:line.
+    --build-arg … ; cosign sign <digest>; write the digest to .ai-review/image.digest (no manual copy).
+  - Threat-model table: risk → control → file:line → SSDF group (PO/PS/PW/RV, NIST SP
+    800-218) → OWASP Top 10 2025 category. Add a SLSA row: the build level claimed (L2 needs
+    signed provenance from a tamper-resistant build platform) and the evidence. Do not
+    claim without evidence.
 
 GLOBAL RULES
 - No placeholders, no TODOs, no "…", no `|| true`, no `curl | sh`.
@@ -47,7 +138,7 @@ GLOBAL RULES
 - No tool reads from the network at scan time.
 - Every tool skips .ai-review/ (its own cache and reports).
 - Diff mode scans committed HEAD only. Say so in --help.
-- Language and scan roots are detected at runtime. Nothing is hardcoded to **/src.
+- Detect language and scan roots at runtime. Do not hardcode **/src.
 
 EXIT POLICY (shared by both scripts; host script passes it through unchanged)
 0 = clean, 1 = findings, 2 = tool/infra error. Final = highest code seen (2 > 1 > 0).
@@ -56,15 +147,30 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
 - semgrep:  --error. 1 → findings, ≥2 → infra.
 - timeout:  124 → infra.
 - Other tools: state their codes in Assumptions, map them the same way.
-
+- Linters: eslint 1 = findings, 2 = infra. ruff 1 = findings, 2 = infra.
+  golangci-lint 1 = findings, other = infra. swiftlint --strict 2 = findings (violations),
+  1 = infra (verify in Assumptions). swiftformat --lint 1 = findings, other = infra.
+  PMD 4 = findings, 1-2 = infra.
+  jscpd --threshold breach = 1. guardrails.sh follows the same 0/1/2 policy.
+- A quality gate failure (section 4) is a finding: exit 1.
+- Docs and comment lint (section 4g) is WARNING only. It never changes the exit code.
+  Its tool status is `warnings`, not `findings`. Exit 0 with warnings stays exit 0.
+  A docs-lint tool crash is still infra: exit 2.
 1) .ai-review/Dockerfile
 - FROM pinned by digest. Distro-correct syntax (addgroup/adduser -S on Alpine).
-- ARG GITLEAKS_VERSION GITLEAKS_SHA256 TRIVY_VERSION TRIVY_SHA256 MIRROR_URL.
+- Build args come from versions.lock.json (a `make`-free wrapper script passes
+  them). ARG GITLEAKS_VERSION GITLEAKS_SHA256 TRIVY_VERSION TRIVY_SHA256 MIRROR_URL, and
+  the same for every other tool in the lock file.
   Empty ARG fails the build: `: "${X:?}"`.
 - Download from MIRROR_URL. `echo "$SHA  file" | sha256sum -c -` in the SAME RUN.
   Install to /opt/ai-review/bin, delete temp files, run `<tool> --version`.
-- PATH=/opt/ai-review/bin:$PATH so pinned tools win over bundled copies.
-- jq, git, coreutils `timeout` present. Fail the build if one is missing.
+- PATH=/opt/ai-review/bin:$PATH. Pinned tools win over bundled copies.
+- Install the quality tools from the lock file the same way (mirror + SHA256, or offline
+  lockfile install with --ignore-scripts / --no-index --require-hashes). Pin versions.
+  Install JDK and Node only if a tool needs them. Pin versions. SwiftLint and SwiftFormat
+  use the static Linux binaries from the mirror (SHA256). No Xcode or Apple SDK in the image.
+  COPY lint/ and quality-gate.json and guardrails.sh → /opt/ai-review/ (read-only, root-owned).
+- jq, git, coreutils `timeout` present. If one is missing, fail the build.
 - User scanner 10001:10001, no login shell. /cache and /artifacts: mode 1777,
   because the runtime UID is the host UID.
 - ENV HOME=/tmp GO111MODULE=on NPM_CONFIG_CACHE=/cache/npm
@@ -80,8 +186,8 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
 - #!/usr/bin/env bash, set -uo pipefail (no -e: every tool must run).
 - Flags: --full-scan (default) | --diff-only [--base-ref REF, default origin/main],
   mutually exclusive. --fix = semgrep --autofix, needs writable /src.
-  --lang LIST (comma-separated, e.g. java,ts). -h/--help. Unknown flag → exit 2.
-- Pre-flight, each failure exits 2 with a clear message:
+  --lang LIST (comma-separated, e.g. java,js,react,ios,python,go). -h/--help. Unknown flag → exit 2.
+- Pre-flight. Each failure exits 2 with a clear message:
   /src is a git repo; /artifacts writable; /cache/trivy/db/trivy.db exists;
   in diff mode `git -C /src rev-parse --verify REF` succeeds
   (message: "fetch on host first: git fetch origin main").
@@ -91,33 +197,41 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
   Pass $BASE to gitleaks (--log-opts "$BASE..HEAD") and semgrep (--baseline-commit $BASE).
   SCAN_ROOT = /tmp/work in diff mode, /src in full mode.
 
-- detect_project(), runs once in SCAN_ROOT, before any tool:
+- detect_project(): run once in SCAN_ROOT, before any tool.
   - Precedence: --lang flag > env AI_REVIEW_LANGS > auto-detection.
-    A flag or env value skips detection. An unknown language → exit 2.
+    A flag or env value skips detection. Unknown language → exit 2.
   - File list: `git ls-files` (skips ignored files). If not a git repo,
-    `find` with the prune list below.
+    use `find` with the prune list below.
   - Language signals (marker file OR ≥1 file with the extension):
       java:   pom.xml, build.gradle, build.gradle.kts, *.java
-      ts:     package.json, tsconfig.json, *.ts, *.tsx, *.js, *.jsx
+      js:     package.json, tsconfig.json, *.ts, *.tsx, *.js, *.jsx, *.mjs, *.cjs
+      react:  (implies js) "react" or "react-dom" or "react-native" or "next" in package.json
+              dependencies/devDependencies/peerDependencies, or any *.tsx / *.jsx file
+      ios:    Package.swift, Podfile, Cartfile, *.xcodeproj, *.xcworkspace, *.swift
       python: pyproject.toml, requirements.txt, setup.py, *.py
       go:     go.mod, *.go
-    Other languages: list them in Assumptions. Nothing matched → generic only.
-  - Monorepo: enable every language that matches.
+    Objective-C (*.m, *.h) and Kotlin/Android are NOT covered. List them in Assumptions.
+    If found, log "unsupported: objc". Nothing matched → generic only.
+  - Monorepo: enable every matching language.
   - Source roots: take each of these that exists as a directory:
       src, app, lib, packages/*/src, apps/*/src, services/*/src,
-      src/main/java, src/test/java, cmd, internal, pkg
-    None exist → roots = "." (the whole SCAN_ROOT). Never scan nothing.
-  - Always prune: .git, .ai-review, node_modules, build, dist, target, vendor, .venv.
+      src/main/java, src/test/java, Sources, App, Targets/*/Sources,
+      and for ios the app-target folder next to each *.xcodeproj
+    If none exist, roots = "." (the whole SCAN_ROOT). Never scan nothing.
+  - Always prune: .git, .ai-review, node_modules, build, dist, target, vendor, Pods,
+    Carthage, DerivedData, .build, .swiftpm, *.xcframework.
   - Log one line:
-    "detected: langs=java,ts roots=src,packages/web/src source=auto|flag|env"
+    "detected: langs=java,js roots=src,packages/web/src source=auto|flag|env"
   - Per tool:
-      semgrep:  --config /opt/ai-review/rules/generic.yaml plus
+      semgrep:  NEVER `--config auto` or any registry pack (network, and the rule set
+                changes without a commit). Name every ruleset by file path.
+                --config /opt/ai-review/rules/generic.yaml plus
                 --config /opt/ai-review/rules/<lang>.yaml per detected language.
                 Pass the roots as targets.
       gitleaks: full history or diff. Language does not apply.
-      trivy:    scans SCAN_ROOT. Lockfile detection is native. Language does not apply.
-  - No language detected: semgrep runs generic rules, logs
-    "no language detected, generic rules only", and this is not an error.
+      trivy:    scans SCAN_ROOT. Lock file detection is native. Language does not apply.
+  - If no language is detected, semgrep runs generic rules and logs
+    "no language detected, generic rules only". This is not an error.
 
 - One run_tool() wrapper: `timeout 900`, tee console → /artifacts/<tool>.log,
   record exit code and duration.
@@ -134,32 +248,662 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
     --sarif --output /artifacts/semgrep.sarif --error
     (configs and targets from detect_project).
   - Other tools: SARIF if supported, else JSON → /artifacts/<tool>.{sarif,json}.
+- Run quality tools after detect_project(), per detected language, in the same run_tool()
+  wrapper. Config comes from /opt/ai-review/lint/. Never read a config from /src
+  (AI-written code must not weaken its own linter). Output is SARIF if supported
+  (eslint --format @microsoft/eslint-formatter-sarif, swiftlint --reporter sarif,
+  PMD -f sarif), else JSON.
+    js:     eslint --no-config-lookup -c lint/eslint.config.mjs --max-warnings 0; tsc --noEmit
+    ios:    swiftlint lint --strict --config lint/.swiftlint.yml;
+            swiftformat --lint --config lint/.swiftformat; plist/entitlements checks (rules)
+    python: ruff check --isolated --config lint/ruff.toml; bandit -r; mypy --strict
+    go:     golangci-lint run -c lint/golangci.yml; go vet
+    java:   pmd check -R lint/pmd-ruleset.xml; checkstyle -c lint/checkstyle.xml; spotbugs
+    all:    jscpd --config lint/jscpd.json (duplication → /artifacts/jscpd.json)
+- Run docs and comment lint (section 4g) after quality tools. Warnings only.
+- Run .ai-review/guardrails.sh after the tools (section 5). Its result is a tool entry.
+- Diff mode: lint and guardrails report only findings on lines changed since $BASE
+  (filter by `git diff -U0`). Full mode reports all. State this in --help.
+- After all tools, evaluate quality-gate.json. Write the gate result into summary.json.
 - /artifacts/summary.json via jq:
   {scope: {langs, roots, source},
-   tools: [{tool, version, mode, exit_code, status: clean|findings|error,
-            findings_count, report_path, duration_s}]}
+   tools: [{tool, version, mode, exit_code, status: clean|findings|warnings|error,
+            findings_count, warnings_count, report_path, duration_s}],
+   quality: {metrics: {...}, gate: passed|failed, failed_conditions: [...]},
+   docs: {warnings_total, by_rule: {...}, files_affected, blocking: false}}
 - trap EXIT: rm -rf /tmp/work, write summary.json even after abort, print summary table.
 
 3) .ai-review/rules/*.yaml (+ .semgrepignore, tests/)
 - Keep every existing rule id. Put each rule in the file for its language.
-  Language-neutral rules go in generic.yaml. python.yaml and go.yaml:
+  Put language-neutral rules in generic.yaml. python.yaml, go.yaml, swift.yaml:
   write new rules for the common CWE classes (injection, deserialization,
-  hardcoded credentials, weak crypto, path traversal).
+  hardcoded credentials, weak crypto, path traversal). Required stack rules:
+  js:   child_process exec with tainted input, eval/new Function, innerHTML /
+        dangerouslySetInnerHTML, prototype pollution (merge/assign of req data), jwt
+        `none`/no verify, NoSQL operator injection, open redirect, SSRF (fetch/axios with
+        user URL), ReDoS-prone regex, express without helmet/CSRF, CORS `*` with credentials.
+  java: SQL/JPQL/HQL string concat, XXE (unsafe DocumentBuilderFactory/SAXParser),
+        ObjectInputStream deserialization, SpEL/OGNL injection, Spring `permitAll` on
+        `/**`, csrf().disable(), actuator exposed, @RequestMapping without method,
+        Runtime.exec with tainted input, weak Random/MD5/SHA1/DES, TrustAllManager,
+        hardcoded password in properties/yaml, path traversal via File(userInput).
+  ios:  ATS off (NSAllowsArbitraryLoads), secrets in UserDefaults/plist, Keychain
+        kSecAttrAccessibleAlways, URLSession trust-all (serverTrust without evaluation),
+        WKWebView JS bridge with remote content, UIWebView, CommonCrypto MD5/SHA1/DES,
+        insecure random (arc4random without secure use for tokens), NSLog/print of
+        sensitive data, http:// URLs, custom URL scheme without validation, pasteboard
+        with secrets, SQLite/CoreData string-built predicates (NSPredicate(format:)).
+        Reference OWASP MASVS in metadata.references.
 - Every rule has:
-  metadata.cwe: ["CWE-<n>: <name>"], owasp: ["A0<n>:2021 - <name>"],
+  metadata.cwe: ["CWE-<n>: <name>"], owasp: ["A0<n>:2025 - <name>"] (keep the 2021 tag in owasp_2021 for old rules;
+  check each category name against the OWASP site, never from memory),
   category: security, confidence, likelihood, impact, references.
-- Taint mode for source→sink rules. Else pattern-either / pattern-inside /
+- Source→sink rules use taint mode. Other rules use pattern-either / pattern-inside /
   metavariable-regex. No pattern starts with a bare `...`.
 - Each rule has a fixture in .ai-review/tests/<rule-id>.<ext> with `// ruleid:`
-  and `// ok:` cases (use `# ruleid:` / `# ok:` in Python).
-- .semgrepignore: .ai-review/, node_modules/, build/, target/, dist/, vendor/, .venv/.
+  and `// ok:` cases (Swift uses `// ruleid:` / `// ok:`; plist/XML fixtures use `<!-- ruleid: -->`).
+- .semgrepignore: .ai-review/, node_modules/, build/, target/, dist/, vendor/, .venv/, Pods/,
+  Carthage/, DerivedData/, .build/.
 - Must pass:
   semgrep --validate --config .ai-review/rules
   semgrep --test --config .ai-review/rules .ai-review/tests
-4) ai-review.sh (host bootstrapper)
-- set -euo pipefail. Check docker exists and daemon is reachable, else exit 2.
+  bash .ai-review/tests/guardrails.sh
+4) QUALITY RULES, LINT CONFIG AND GATE
+Principle: strictest config is the default. Every disabled rule needs a one-line
+reason in the config file. Do not turn off a rule to make existing code pass.
+
+4a. Sonar-equivalent rules (implement via the named linter or a Semgrep rule in
+    quality.yaml; map each to a Sonar key in metadata.sonar_key)
+  Reliability:
+    S1181 catch Throwable/Exception generically; S108/S2486 empty catch/block;
+    S2259 null dereference; S1854 dead store; S1481 unused variable; S1172 unused param;
+    S3776 cognitive complexity; S1066 collapsible if; S2589 always-true condition;
+    S4144 identical function bodies; S1186 empty function; S2201 ignored return value;
+    unhandled promise / floating promise; missing await; mutable default argument (py); unchecked error return (go: errcheck);
+    force unwrap / `try!` / `as!` (swift); retain cycle without [weak self];
+    resource not closed (S2095).
+  Maintainability (SOLID/DRY):
+    S138 function length; S107 parameter count; S1192 duplicated string literal;
+    S1448 class too many methods; S1820 too many fields; S104 file length;
+    S134 nesting depth; S1200 class coupling; S3358 nested ternary; S125 commented-out code;
+    S1135 TODO/FIXME left in code; S1118 utility class constructor; S1075 hardcoded URI/path;
+    S109 magic number; S100/S117 naming conventions; S1213 member order.
+  SOLID checks (Semgrep/PMD/eslint, each a rule with fixture):
+    SRP:  class/module over method, field, or import count thresholds (S1448, S1820, S1200);
+    OCP:  long if/else-if or switch chain on a type tag (≥ 4 branches);
+    LSP:  override that throws UnsupportedOperationException / NotImplementedError / fatalError;
+    ISP:  interface/abstract class with > 7 methods; empty or throwing implemented methods;
+    DIP:  `new` of a concrete service/repository inside business logic; direct import of
+          infrastructure (db, http client, fs) from a domain/ package.
+  DRY: jscpd min-tokens 50, min-lines 5; fail above the duplication threshold in 4c.
+       Semgrep: same literal ≥ 3 times in a file; same block copied across files.
+  Security (Sonar hotspots): S2068 hardcoded credentials; S4790 weak hash; S5542/S5547
+    weak cipher; S2245 insecure random; S5332 cleartext protocol; S4423 weak TLS;
+    S3649/S2077 SQL built from strings; S5144 SSRF; S2083 path traversal; S5334 eval;
+    S4829 logging sensitive data; S5122 permissive CORS; S4507 debug on in production.
+
+4b. Lint config rules
+  - js: strict TypeScript. no-explicit-any, no-non-null-assertion, no-floating-promises,
+    no-misused-promises, switch-exhaustiveness-check, eqeqeq, no-eval, no-implied-eval,
+    no-var, prefer-const, complexity ≤ 10, max-depth ≤ 4, max-lines-per-function ≤ 50,
+    max-params ≤ 4, max-lines ≤ 300, import/no-cycle, import/no-default-export,
+    sonarjs/recommended (all), security/recommended-legacy (all).
+  - python: ruff select = E,F,W,I,B,C90,S,SIM,UP,PL,RUF,ARG,ERA,T20,PTH,TRY,PERF,
+    mccabe ≤ 10, max-args 5, max-branches 12, max-statements 50. mypy --strict.
+    Bandit B1xx–B7xx all on.
+  - go: golangci-lint enable errcheck, govet, staticcheck, gosec, revive, gocyclo ≤ 10,
+    gocognit ≤ 15, dupl, funlen, nestif, ineffassign, unused, gofumpt, bodyclose, noctx.
+  - ios: SwiftLint --strict. opt_in_rules: force_unwrapping, force_cast, force_try,
+    implicitly_unwrapped_optional, unused_import, unused_declaration (needs index; off,
+    say so), weak_delegate, no_print (custom regex for print/NSLog/debugPrint),
+    cyclomatic_complexity warn 10 / error 15, function_body_length 50, type_body_length
+    250, file_length 300, function_parameter_count 4, nesting 3, large_tuple 2,
+    identifier_name, discouraged_optional_collection, empty_count, fatal_error_message,
+    todo, custom rules for hardcoded http:// and secrets. SwiftFormat --lint with
+    a fixed ruleset. Use Swift 6 strict concurrency conventions (Sendable, @MainActor).
+  - java: PMD categories bestpractices, design, errorprone, security, performance,
+    codestyle (minus rules that conflict with Checkstyle). Checkstyle: sun-checks
+    minus the Javadoc and final-parameter rules. SpotBugs effort max, threshold low,
+    plugin find-sec-bugs.
+  - Inline suppressions (`eslint-disable`, `# noqa`, `# type: ignore`, `//nolint`, `@ts-ignore`, `@ts-nocheck`,
+    `swiftlint:disable`, `@SuppressWarnings`, `// NOSONAR`, `nosemgrep`) are findings unless they
+    carry a rule id AND a reason (see guardrail G3).
+
+4c. quality-gate.json defaults (override only by editing this file)
+  {"new_code": {"coverage_min": 80, "duplication_max_pct": 3,
+                "max_cognitive_complexity": 15, "max_function_lines": 50,
+                "max_file_lines": 300, "max_params": 4, "max_nesting": 4,
+                "new_blocker": 0, "new_critical": 0, "new_major": 0,
+                "new_security_hotspots_unreviewed": 0,
+                "new_vulnerabilities": 0, "new_bugs": 0, "new_code_smells_max": 0},
+   "overall": {"duplication_max_pct": 5, "maintainability_rating": "A",
+               "reliability_rating": "A", "security_rating": "A",
+               "security_hotspots_unreviewed": 0, "coverage_min": 60}}
+  Basis: the SonarQube "Sonar way" gate (new code: no new issues, all new hotspots
+  reviewed, coverage ≥ 80%, duplication ≤ 3%) and "Sonar way for AI Code" (adds overall
+  code: security rating A, hotspots reviewed, reliability rating). Sonar advises an
+  overall-code coverage condition because AI code can land in old code. This file
+  does that ("overall.coverage_min"). Ours is stricter than Sonar on reliability (A, not C).
+  A hotspot is "reviewed" when .ai-review/hotspots-reviewed.json lists its fingerprint
+  with reviewer and date. Gates judge new code first, so legacy debt does not block
+  adoption. A baseline file holds accepted legacy findings (Semgrep --baseline-commit,
+  gitleaks baseline).
+  Ratings follow Sonar: A = no issues of that type at Major or above.
+  Coverage comes from a report in /src (lcov, coverage.xml, cover.out, jacoco.xml).
+  If no coverage report exists, the gate fails with "coverage report missing".
+
+4d. JAVA PROFILE (applies when java is detected; Maven, Gradle, Spring/Jakarta, Lombok, JPA)
+  Build detection: pom.xml → Maven (`mvn -o -B -q`). build.gradle(.kts) → Gradle
+    (`gradle --offline --no-daemon`). Do NOT run wrapper scripts (they download).
+    Pre-seed dependencies and plugins in /cache/m2 or /cache/gradle. If missing,
+    exit 2 "seed the Java cache on host". Multi-module: iterate modules, report per module.
+    Read JDK version from maven.compiler.release / toolchain / sourceCompatibility.
+    Unsupported or EOL JDK (< 17) = finding.
+  Compile gate: `javac -Xlint:all -Werror` equivalent through the build (`-parameters`,
+    `-proc:full` for Lombok). Any compiler warning = finding.
+  PMD rule ids to enable (lint/pmd-ruleset.xml; if excluded, one line each with a reason):
+    bestpractices: UnusedPrivateField, UnusedLocalVariable, UnusedFormalParameter,
+      UnusedPrivateMethod, SystemPrintln, AvoidReassigningParameters,
+      PreserveStackTrace, LooseCoupling, MissingOverride, UseVarargs,
+      ForLoopCanBeForeach, OneDeclarationPerLine, AvoidUsingHardCodedIP,
+      ReplaceHashtableWithMap, ReplaceVectorWithList, UnusedAssignment.
+    errorprone: EmptyCatchBlock, AvoidCatchingThrowable, AvoidCatchingNPE,
+      AvoidCatchingGenericException, CloseResource, CompareObjectsWithEquals,
+      ReturnEmptyCollectionRatherThanNull, NullAssignment, AvoidLiteralsInIfCondition,
+      AssignmentInOperand, MissingSerialVersionUID, DoNotTerminateVM, DoNotThrowExceptionInFinally,
+      AvoidBranchingStatementAsLastInLoop, EqualsNull, ImplicitSwitchFallThrough,
+      UseProperClassLoader, UseLocaleWithCaseConversions, AvoidFieldNameMatchingMethodName,
+      AvoidInstanceofChecksInCatchClause, SuspiciousEqualsMethodName, ConstructorCallsOverridableMethod.
+    design: CyclomaticComplexity (method 10, class 50), CognitiveComplexity (15),
+      NPathComplexity (200), NcssCount (method 30, class 300), GodClass, TooManyMethods
+      (maxmethods 25), TooManyFields (15), ExcessiveParameterList (4),
+      ExcessiveImports (30), CouplingBetweenObjects (20), LawOfDemeter, SingularField,
+      ImmutableField, AvoidThrowingRawExceptionTypes, AvoidThrowingNullPointerException,
+      SimplifyBooleanReturns, SimplifiedTernary, ClassWithOnlyPrivateConstructorsShouldBeFinal,
+      AvoidDeeplyNestedIfStmts (3), SwitchDensity, AbstractClassWithoutAnyMethod,
+      DataClass, UseUtilityClass, SignatureDeclareThrowsException, CollapsibleIfStatements.
+    security: HardCodedCryptoKey, InsecureCryptoIv.
+    performance: AvoidInstantiatingObjectsInLoops, UseStringBufferForStringAppends,
+      InefficientStringBuffering, StringInstantiation, UseIndexOfChar, AvoidFileStream.
+    multithreading: AvoidSynchronizedAtMethodLevel, DoubleCheckedLocking, UnsynchronizedStaticFormatter,
+      AvoidThreadGroup, DontCallThreadRun, NonThreadSafeSingleton, UseConcurrentHashMap.
+    codestyle: UnnecessaryImport, UnnecessaryFullyQualifiedName, UselessParentheses,
+      ClassNamingConventions, MethodNamingConventions, LocalVariableNamingConventions,
+      FormalParameterNamingConventions, ConfusingTernary, UnnecessaryConstructor,
+      UnnecessaryModifier, PrematureDeclaration, AvoidProtectedFieldInFinalClass.
+    Pin PMD rule names to the installed PMD version in Assumptions. A name missing
+    in that version is an error, not a skip.
+  Checkstyle modules: NeedBraces, EqualsHashCode, FallThrough, MissingSwitchDefault,
+    SimplifyBooleanExpression, SimplifyBooleanReturn, StringLiteralEquality, IllegalCatch,
+    IllegalThrows, IllegalType, MagicNumber, HiddenField, InnerAssignment,
+    MultipleStringLiterals (allowedDuplicates 2), ParameterNumber (4), MethodLength (50),
+    FileLength (300), LineLength (120), CyclomaticComplexity (10), NPathComplexity,
+    BooleanExpressionComplexity (3), ClassFanOutComplexity (20), ClassDataAbstractionCoupling,
+    NestedIfDepth (3), NestedTryDepth (2), ReturnCount (max 3), AvoidStarImport,
+    UnusedImports, RedundantImport, ModifierOrder, FinalClass, HideUtilityClassConstructor,
+    InterfaceIsType, VisibilityModifier, TodoComment, UpperEll, ArrayTypeStyle, AvoidNestedBlocks.
+  SpotBugs: effort max, threshold low, plugins find-sec-bugs and fb-contrib. All categories
+    on: CORRECTNESS, BAD_PRACTICE, MT_CORRECTNESS, MALICIOUS_CODE, PERFORMANCE,
+    SECURITY, EXPERIMENTAL. Key patterns: NP_NULL_ON_SOME_PATH, EI_EXPOSE_REP,
+    SQL_INJECTION_JDBC, PATH_TRAVERSAL_IN, COMMAND_INJECTION, XXE_DOCUMENT,
+    OBJECT_DESERIALIZATION, HARD_CODE_PASSWORD, WEAK_MESSAGE_DIGEST_MD5, PREDICTABLE_RANDOM,
+    CIPHER_INTEGRITY, ECB_MODE, SPRING_CSRF_PROTECTION_DISABLED, SPRING_ENDPOINT,
+    CRLF_INJECTION_LOGS, LDAP_INJECTION, TRUST_BOUNDARY_VIOLATION, URLCONNECTION_SSRF_FD.
+  Compile-time null and bug checks: Error Prone (2.14 or newer) with NullAway as compiler
+    plugin on every build. NullAway `check("NullAway", ERROR)` (default is warn).
+    Use OnlyNullMarked / @NullMarked (JSpecify) for packages. Exclude generated code with
+    -XepExcludedPaths (Lombok, MapStruct, jOOQ, protobuf outputs). NullAway is practical, not
+    complete. It does not replace PMD/SpotBugs. Error Prone checks promoted to ERROR:
+    MissingOverride, ReturnValueIgnored, CheckReturnValue, FutureReturnValueIgnored,
+    ImmutableEnumChecker, EqualsHashCode, UnusedVariable, StringSplitter,
+    JavaTimeDefaultTimeZone, DefaultCharset, ThreadLocalUsage, InlineMeSuggester.
+    Verify each name against the installed version. List missing names in Assumptions.
+    Formatting: Spotless (google-java-format) check mode only. A format diff = finding.
+    Dependency scan offline: Trivy (java-db). OWASP Dependency-Check offline mode is NOT
+    verified here. Do not add it unless resolve.sh can fetch and verify its data feed.
+  Architecture tests (SOLID/DIP enforced, ArchUnit, run in test phase offline):
+    no cycles between packages; domain/ does not import infrastructure/, web/, jakarta.persistence
+    in pure domain; controllers do not call repositories directly; no @Service in web
+    packages; no field injection (@Autowired on fields), constructor injection only;
+    no `java.util.Date`/`Calendar` (use java.time); no `System.out`; no `printStackTrace`;
+    exceptions from `..api..` are checked/typed per project convention; layered architecture
+    controller → service → repository only. Pipeline ships a default ArchUnit rule
+    set in /opt/ai-review/lint/archunit/. It runs the set against compiled classes.
+  Spring/Jakarta Semgrep rules (rules/java.yaml): @RequestBody without @Valid,
+    @PathVariable/@RequestParam used in a query without binding, @CrossOrigin("*"),
+    @Transactional on private/self-invoked methods, @Async/@Scheduled without error
+    handler, @RestController returning entities (no DTO), mass assignment (binding a
+    JPA entity), `@Query(nativeQuery=true)` with concat or SpEL `#{...}`, RestTemplate/
+    WebClient without timeout, `spring.jpa.show-sql=true` / `management.endpoints.web.exposure.include=*`
+    / `server.error.include-stacktrace=always` / `spring.h2.console.enabled=true` /
+    `debug=true` in application*.{properties,yml}, plain-text secrets in application*.
+    Lombok: @Data on JPA entity, @EqualsAndHashCode on entity with relations, @SneakyThrows,
+    @Builder with mutable collections. JPA: FetchType.EAGER on collections, N+1 loops over
+    lazy relations, `open-in-view` true. Concurrency: shared mutable static, SimpleDateFormat
+    as static field, `new Thread` instead of executor, unbounded thread pools, `synchronized`
+    on non-final field. Resources: try-with-resources for Closeable. Logging: SLF4J
+    parameterized messages only (no string concat), no PII/token in log calls.
+  Tests: JUnit 5 only. Findings for: JUnit 4 imports in new files, `@Test` with no assertion,
+    `Thread.sleep` in tests, `@Disabled` without ticket id, `@MockBean` of the class under test,
+    `assertTrue(true)`, catch-and-pass in tests. Coverage: JaCoCo XML (line + branch).
+    Gate: branch coverage ≥ 70% on new code. If pitest is declared in the build, report
+    PIT mutation score ≥ 60% (not gating).
+  Dependencies: Trivy on pom.xml/gradle.lockfile (offline java-db). Findings for: SNAPSHOT
+    versions, dynamic versions (`+`, `LATEST`, `RELEASE`, ranges), `http://` repositories,
+    dependency without pinned version (no BOM), duplicate versions of same artifact,
+    plugins with `<version>` missing, `<scope>system</scope>`. Require Maven Enforcer rules
+    (dependencyConvergence, banDuplicatePomDependencyVersions, requireJavaVersion) in the pom.
+
+4e. JAVASCRIPT / TYPESCRIPT PROFILE (applies when js is detected; Node, browser, React, Next, Express, NestJS)
+  Detection: package.json "type", "engines", "workspaces". Lockfile (package-lock.json,
+    pnpm-lock.yaml, yarn.lock) is REQUIRED. No lockfile = finding. Trivy cannot run
+    properly without it. Framework hints: react, next, vue, @angular/core, svelte, express, fastify,
+    @nestjs/core, koa, hono, react-native. Each enables its extra rules below.
+  Package manager policy: pin the manager (`packageManager` field with hash, corepack).
+    `.npmrc` must contain ignore-scripts=true, allow-git=none, engine-strict=true,
+    package-lock=true, audit-level=high. Recommend release-age cooldown
+    (`min-release-age`, 7–30 days) and pnpm 10+ (install scripts blocked by default; allowlist
+    in `onlyBuiltDependencies`, each entry with a reason). Prefer `npm ci`. `npm install` in CI
+    is a finding. lockfile-lint style checks: allowed hosts only (internal mirror), https only,
+    integrity present. Provenance: build published packages in CI with `npm publish --provenance`.
+    Extra tools (baked, offline, optional if input provides them): knip (unused files,
+    exports, dependencies), publint (package exports), madge or dependency-cruiser (cycles),
+    @arethetypeswrong/cli for libraries.
+  Install/run: Do not run `npm install` or lifecycle scripts. Use pre-baked ESLint and
+    TypeScript in /opt/ai-review/node_modules. Run `tsc --noEmit -p <tsconfig>` per tsconfig found.
+    If repo has no tsconfig.json, run `tsc --allowJs --checkJs --noEmit` with the default
+    strict config in lint/tsconfig.base.json.
+  tsconfig gate (finding if missing or weakened): strict, noImplicitAny, strictNullChecks,
+    noUncheckedIndexedAccess, exactOptionalPropertyTypes, noImplicitReturns,
+    noFallthroughCasesInSwitch, noUnusedLocals, noUnusedParameters, useUnknownInCatchVariables,
+    forceConsistentCasingInFileNames. skipLibCheck allowed. allowJs without checkJs = finding.
+  ESLint (flat config, eslint.config.mjs) plugins and rules, all at "error":
+    @eslint/js recommended; typescript-eslint strictTypeChecked + stylisticTypeChecked with
+    parserOptions.projectService; eslint-plugin-sonarjs (all rules incl. cognitive-complexity 15,
+    no-duplicate-string 3, no-identical-functions, no-collapsible-if, no-redundant-boolean,
+    no-nested-switch, no-small-switch, no-inverted-boolean-check, prefer-immediate-return,
+    no-all-duplicated-branches, no-ignored-return, no-unused-collection, no-use-of-empty-return-value,
+    no-gratuitous-expressions, no-hardcoded-credentials, no-hardcoded-ip, no-clear-text-protocols,
+    no-weak-keys, cookie-no-httponly, content-security-policy,
+    no-os-command-from-path, os-command, sql-queries, no-intrusive-permissions, x-powered-by,
+    insecure-cookie, disabled-auto-escaping, no-ip-forward, hashing, pseudo-random, encryption,
+    certificate-transparency, link-with-target-blank, weak-ssl, file-uploads, post-message,
+    unverified-certificate, unverified-hostname, session-regenerate, no-mime-sniff,
+    strict-transport-security, dns-prefetching-control, frame-ancestors, confidential-information-logging,
+    production-debug, publicly-writable-directories, disabled-resource-integrity, cors, csrf,
+    xml-parser-xxe, no-unsafe-unzip, aws-*: all enabled. Rule names differ between plugin versions.
+    Check each against the installed version. List missing names in Assumptions);
+    eslint-plugin-security (detect-eval-with-expression, detect-child-process,
+    detect-non-literal-fs-filename, detect-non-literal-regexp, detect-non-literal-require,
+    detect-object-injection, detect-possible-timing-attacks, detect-unsafe-regex,
+    detect-buffer-noassert, detect-disable-mustache-escape, detect-no-csrf-before-method-override,
+    detect-new-buffer, detect-pseudoRandomBytes, detect-bidi-characters);
+    eslint-plugin-import-x (no-cycle, no-self-import, no-extraneous-dependencies,
+    no-unresolved, no-default-export, no-mutable-exports, no-duplicates, no-relative-packages,
+    first, order, no-restricted-paths for layer boundaries);
+    eslint-plugin-promise (always-return, no-nesting, no-return-wrap, catch-or-return,
+    no-multiple-resolved, prefer-await-to-then); eslint-plugin-unicorn (error-message,
+    no-array-for-each off with a reason in config, prefer-node-protocol, no-process-exit, throw-new-error,
+    no-null off with a reason in config, prefer-optional-catch-binding, no-useless-undefined);
+    eslint-plugin-n (no-sync, no-deprecated-api, no-process-env outside config module,
+    no-missing-import, prefer-global/*); eslint-plugin-no-secrets (tolerance 4.2);
+    eslint-plugin-regexp (all recommended); eslint-plugin-jsdoc (require-jsdoc on exported
+    API only); eslint-plugin-jest/vitest (no-focused-tests, no-disabled-tests, no-identical-title,
+    expect-expect, no-conditional-expect, valid-expect, no-standalone-expect, prefer-strict-equal,
+    no-commented-out-tests); eslint-plugin-testing-library when used.
+  Core rules: eqeqeq always, no-eval, no-implied-eval, no-new-func, no-var, prefer-const,
+    no-param-reassign (props true), no-shadow, no-throw-literal, no-return-await off in favor
+    of @typescript-eslint/return-await in-try-catch, no-console (error; allow warn/error only in
+    a logger module), no-alert, no-await-in-loop, require-atomic-updates, no-nested-ternary,
+    no-unneeded-ternary, no-lonely-if, no-else-return, no-magic-numbers (ignore 0,1,-1),
+    complexity 10, max-depth 4, max-nested-callbacks 3, max-lines-per-function 50 (skip blank
+    and comments), max-lines 300, max-params 4, max-statements 20, max-classes-per-file 1,
+    id-length min 2, camelcase, no-restricted-syntax (WithStatement, labels, `for in` without
+    guard, TS `enum` → use const objects, `namespace`), no-restricted-imports (lodash whole
+    package, moment, request, deprecated libs, `fs` sync APIs in server handlers,
+    `child_process` outside an allowlisted module), no-restricted-globals (event, name, process
+    in browser code), no-restricted-properties (Math.random for secrets, Object.assign on
+    req data).
+  typescript-eslint rules (type-aware): no-explicit-any, no-unsafe-assignment, no-unsafe-call,
+    no-unsafe-member-access, no-unsafe-return, no-unsafe-argument, no-non-null-assertion,
+    no-non-null-asserted-optional-chain, no-floating-promises, no-misused-promises,
+    await-thenable, require-await, promise-function-async, switch-exhaustiveness-check,
+    strict-boolean-expressions, no-unnecessary-condition, no-unnecessary-type-assertion,
+    prefer-nullish-coalescing, prefer-optional-chain, no-confusing-void-expression,
+    no-base-to-string, restrict-template-expressions, restrict-plus-operands,
+    only-throw-error, prefer-promise-reject-errors, consistent-type-imports,
+    consistent-type-definitions (interface), no-import-type-side-effects, no-deprecated,
+    explicit-module-boundary-types (exported API), no-dynamic-delete, no-unsafe-enum-comparison,
+    ban-ts-comment (no @ts-ignore / @ts-nocheck; @ts-expect-error needs ≥ 10-char reason),
+    no-unsafe-type-assertion, no-unused-vars (args after-used, caughtErrors all),
+    method-signature-style, naming-convention (types PascalCase, vars camelCase, consts UPPER_CASE).
+  React rules (when react present): eslint-plugin-react (jsx-key, no-danger,
+    no-danger-with-children, jsx-no-target-blank, jsx-no-script-url, no-unstable-nested-components,
+    no-array-index-key, no-unsafe, jsx-no-constructed-context-values, no-this-in-sfc,
+    jsx-no-useless-fragment, self-closing-comp, void-dom-elements-no-children, function-component-definition),
+    react-hooks (rules-of-hooks error, exhaustive-deps error), jsx-a11y recommended (all errors),
+    max 150 lines per component, props ≤ 7, no prop spreading of untrusted objects.
+    Next.js: @next/eslint-plugin-next core-web-vitals; `dangerouslySetInnerHTML`, `getServerSideProps`
+    returning secrets, secrets in NEXT_PUBLIC_*, missing `rel="noopener"`.
+  Node/Express/Nest/Fastify rules (rules/javascript.yaml, taint mode where source→sink):
+    req.body/query/params/headers → child_process.exec/spawn(shell)/execSync, fs.* path, eval,
+    new Function, vm.runIn*, require(variable), RegExp(variable), res.redirect (open redirect),
+    fetch/axios/got/http.request URL (SSRF), SQL (pg/mysql2/sequelize.query/knex.raw/prisma.$queryRawUnsafe)
+    string concat, Mongo filters from raw body ($where, $ne, $gt operators), res.send/innerHTML (XSS),
+    jwt.verify with algorithms:['none'] or missing, jwt.sign with weak/hardcoded secret,
+    bcrypt cost < 10, crypto.createHash md5/sha1, createCipher (deprecated), Math.random for tokens,
+    cookies without httpOnly/secure/sameSite, session secret hardcoded, express without helmet,
+    no rate limit on auth routes, cors origin '*' or reflect with credentials, body parser
+    without size limit, file upload (multer) without limits/fileFilter, path.join with user input
+    without normalization check, zip-slip, XML parsers with external entities, `unserialize`/
+    `node-serialize`, `dotenv` committed .env, `process.env` secrets logged, stack traces returned
+    to client, `app.disable('x-powered-by')` missing, unhandled `'error'` events, missing
+    `process.on('unhandledRejection')` policy, `setTimeout(string)`, `JSON.parse` of untrusted
+    input without try/catch, prototype pollution (`merge`, `defaultsDeep`, `set`, `Object.assign`
+    with req data, `__proto__`, `constructor.prototype`), ReDoS (nested quantifiers), timing-unsafe
+    secret comparison (=== on tokens → crypto.timingSafeEqual), NestJS: controller without
+    ValidationPipe/class-validator DTO, @Body() any, missing Guards on non-public routes,
+    ClassSerializerInterceptor missing for entities, TypeORM `query()` with template concat.
+  Browser rules: innerHTML/outerHTML/insertAdjacentHTML/document.write, `target=_blank` without
+    noopener, postMessage with '*' origin or no origin check, localStorage/sessionStorage for tokens,
+    `window.location = userInput`, eval-like timers, inline event-handler strings, missing SRI on
+    CDN scripts, `http://` resources, CSP-weakening (`unsafe-inline`, `unsafe-eval`) in meta/headers,
+    `Object.prototype` mutation, third-party script injection.
+  package.json / supply chain (G1 detail): findings for: lifecycle scripts (preinstall, install,
+    postinstall, prepare) in new deps or root; dependencies from git/http/file/tarball URLs;
+    `*`, `latest`, `x`, or range-less loose versions in dependencies; missing `engines`;
+    packages in dependencies that belong in devDependencies (test, lint, types) and the reverse;
+    duplicate packages in both; lockfile integrity hash missing or `resolved` pointing at a host
+    other than internal mirror; lockfile not matching package.json; deprecated packages;
+    `overrides`/`resolutions` that pin to a lower version; new dependency not in
+    .ai-review/allowed-deps.txt; name within edit distance 2 of a top package (typosquat);
+    unscoped package that shadows an internal @scope name (dependency confusion).
+  Tests: Jest or Vitest. Findings for: `.only`/`.skip`/`xit`/`xdescribe`/`fdescribe`, tests with no `expect`,
+    snapshot-only tests for logic, `jest.mock` of module under test, `setTimeout`-based waits,
+    network calls in unit tests, `any` in test helpers, missing `await` on async assertions
+    (`expect(...).resolves/rejects` not awaited), unconditional `expect(true).toBe(true)`.
+    Coverage: lcov or coverage-final.json. Gate: lines ≥ 80%, branches ≥ 70% on new code.
+    If stryker config exists, report Stryker mutation score (not gating).
+  Bundle/perf hygiene (warn-level findings reported in quality metrics, gating off by default):
+    import of whole lodash/moment/rxjs, dynamic `require` in ESM, sync fs in request path,
+    `await` in loops over independent promises (use Promise.all), unbounded `Promise.all` on user
+    input, array `.includes` in hot loops over big arrays, missing `AbortController`/timeout on fetch.
+  Architecture (dependency-cruiser config in lint/depcruise.cjs): no circular dependencies;
+    ui/ → domain/ → infra/ direction only; no deep imports into other packages
+    (`packages/*/src/*`); no test files imported from source; no `devDependencies` imported from
+    source; report orphan modules. Fail on violations of severity "error".
+
+4f. REACT PROFILE (applies when react is detected; React 18/19, Next.js, Vite, React Native, Redux/Zustand/React Query)
+  Detection: read the react version from the lock file. React < 18 or an EOL major
+    = finding. Frameworks: next, vite, react-scripts (CRA is deprecated = finding), remix,
+    gatsby, react-native/expo. Each framework turns on its rule group below.
+  Tooling (all from /opt/ai-review, configs in lint/eslint.config.mjs, react block):
+    eslint-plugin-react (flat/recommended + jsx-runtime), eslint-plugin-react-hooks,
+    eslint-plugin-jsx-a11y (strict), eslint-plugin-react-refresh (only-export-components),
+    @tanstack/eslint-plugin-query when react-query is used, eslint-plugin-testing-library
+    + jest-dom, @next/eslint-plugin-next (core-web-vitals) for Next.js,
+    eslint-plugin-react-native when react-native is present.
+  Hooks and rendering (error):
+    rules-of-hooks; exhaustive-deps (never disabled; a disable comment is a G3 finding);
+    no hooks in conditions, loops or after early return; no setState in render;
+    no state update in useEffect derived from props/state (derive in render or
+    useMemo); effect without cleanup for subscriptions, timers, listeners, fetch
+    (AbortController); async function passed directly to useEffect; stale closure in
+    setInterval/event handlers (use ref or functional update); object/array/function
+    literals in context value, deps, or props to memoized children
+    (jsx-no-constructed-context-values, jsx-no-bind in memoized trees);
+    key = array index or Math.random(); missing key; index key in reorderable lists;
+    unstable nested components (no-unstable-nested-components); component defined
+    inside component; mutating props or state (push, splice, direct assignment,
+    sort/reverse on state arrays); useState initializer computed every render
+    (use lazy init); useMemo/useCallback with empty or wrong deps; useRef read/write
+    during render; `use client`/`use server` directive missing or misplaced (Next/RSC).
+  Maintainability and SOLID in React:
+    component ≤ 150 lines, ≤ 7 props, ≤ 5 useState, ≤ 3 useEffect, JSX nesting ≤ 6,
+    cognitive complexity ≤ 15; one exported component per file; no business logic or
+    fetch in presentational components (move to hooks/services: SRP, DIP); custom hooks
+    named use*, ≤ 80 lines, return stable references; no prop drilling beyond 3 levels
+    (use composition or context); no boolean-prop explosion (≥ 4 boolean props = finding,
+    use variants); no inline styles for static values; no duplicated JSX block ≥ 10 lines
+    (jscpd tokens, DRY); no copy-pasted useEffect/fetch logic (extract hook or React Query);
+    prefer composition over inheritance (class components and `extends React.Component`
+    in new code = finding); no PropTypes with TypeScript; type props with an
+    interface; no `React.FC` with implicit children; no `any` in props; no default
+    export of anonymous components (displayName lost); named exports; file name matches
+    the component; colocated tests.
+  State and data:
+    server state through React Query/SWR, not useEffect+useState fetch pairs (finding);
+    no global mutable singletons; Redux Toolkit only (no hand-written reducers with
+    mutation outside immer, no non-serializable values in the store); memoized selectors;
+    forms through react-hook-form + zod (or the repo's chosen validator); uncontrolled/
+    controlled input switching; missing loading, error and empty states for every query;
+    every promise in an event handler has catch/error state; Error Boundary around
+    each route; Suspense fallback for lazy components; no fetch in render.
+  Security (rules/react.yaml, taint mode):
+    props/state/URL params/location/postMessage/localStorage → dangerouslySetInnerHTML,
+    innerHTML via ref, `href`/`src`/`action` with `javascript:` or untrusted URL
+    (validate protocol allowlist http/https/mailto), `target="_blank"` without
+    rel="noopener noreferrer", `eval`/`new Function`, `window.open` with user URL,
+    `ReactDOM.render` into user-controlled node, server-side rendering of unescaped JSON
+    into <script> (use serialize-javascript), markdown rendering without sanitizer
+    (DOMPurify required before any HTML sink), tokens/PII in localStorage/sessionStorage
+    (use httpOnly cookies), secrets in VITE_*/REACT_APP_*/NEXT_PUBLIC_* env names,
+    hardcoded API keys in bundle, `postMessage` with '*', `dangerouslySetInnerHTML` of CMS
+    content, spreading untrusted objects into props (`{...userProps}`), user-controlled
+    `style`/`className` injection, iframes without sandbox/allow, CSRF token missing on
+    state-changing fetch with cookies, `credentials: 'include'` to non-same-origin,
+    open redirect through `navigate(userInput)`/`<Navigate to>`, react-router loader/
+    action without auth check, Next.js: Server Action without auth/zod validation,
+    API route without method check or input validation, `getServerSideProps` returning
+    secrets or full DB rows, `next.config` with `dangerouslyAllowSVG`/wildcard `images.domains`,
+    missing security headers (CSP, X-Frame-Options, Referrer-Policy), `rewrites` to
+    user-controlled hosts. React Native: AsyncStorage for secrets (use Keychain/Keystore),
+    WebView with `originWhitelist=['*']` or `javaScriptEnabled` on untrusted URLs,
+    cleartext traffic, deep link handler without validation, `console.log` of secrets.
+  Accessibility (jsx-a11y, all errors; also WCAG 2.2 AA references in metadata):
+    alt-text, anchor-is-valid, anchor-has-content, aria-props, aria-proptypes, aria-role,
+    aria-unsupported-elements, click-events-have-key-events, control-has-associated-label,
+    heading-has-content, html-has-lang, iframe-has-title, img-redundant-alt,
+    interactive-supports-focus, label-has-associated-control, media-has-caption,
+    mouse-events-have-key-events, no-access-key, no-autofocus, no-distracting-elements,
+    no-interactive-element-to-noninteractive-role, no-noninteractive-element-interactions,
+    no-noninteractive-tabindex, no-redundant-roles, no-static-element-interactions,
+    prefer-tag-over-role, role-has-required-aria-props, role-supports-aria-props, scope,
+    tabindex-no-positive. Clickable <div>/<span> without role+key handler = finding.
+  Performance (reported as metrics; only the first three gate):
+    gating: whole-library imports (lodash, moment, @mui/icons-material barrel), `await`
+    in render path, missing lazy() for route-level components over 50 kB;
+    reported: inline functions/objects in hot lists, large lists without virtualization
+    (≥ 200 items), images without width/height or `next/image`, missing React.memo on
+    list items passed stable props, unnecessary re-render sources (context value change),
+    useEffect with no deps array.
+  Testing (Jest/Vitest + React Testing Library):
+    query by role/label/text, not by test-id first; no `container.querySelector`; no
+    implementation-detail assertions (state, instance); `userEvent` over `fireEvent`;
+    `await findBy*`/`waitFor` for async; no `waitFor` with side effects; no arbitrary
+    `setTimeout`; no `act` warnings; mock network with MSW, not by mocking fetch of the
+    unit; no snapshot-only component tests; each component with logic has a test for
+    loading, error, empty, success; a11y assertion (jest-axe) on page-level components;
+    `.only`/`.skip` forbidden (G4). Coverage gate for components: lines ≥ 80%.
+  Build/config: React Strict Mode on; `key` warnings and console errors fail tests
+    (setup file turns console.error into a throw); no source maps in production
+    in the publish config; no `devtools`/redux-devtools in production build;
+    `.env*` files with secrets = findings; do not run bundle report via `vite build --mode`
+    (needs a build); size check only on committed budget file if present.
+
+4g. DOCS AND COMMENT LINT (ASD-STE100-based, WARNING ONLY)
+Goal: flag messy docs and comments. Never block. Show the count in the summary.
+- Severity: every docs finding is SARIF level `warning` (or `note`). Never `error`.
+  Exit code stays 0 for warnings. Opt-in blocking: `docs.blocking: true` in
+  quality-gate.json (default false). Only a human sets it.
+- Scope: Markdown/text docs (*.md, *.mdx, *.txt, *.rst, docs/**), and comments in
+  java, js/ts/jsx/tsx, swift, python, go files. Skip generated files, vendor dirs,
+  CHANGELOG, LICENSE, lock files, and files with the header "generated".
+  Diff mode: warn only on changed lines. Full mode: all lines.
+- Tools (offline, config from /opt/ai-review/lint, never from /src):
+    vale --config lint/vale.ini --output=JSON (comment scopes for code files; check
+      which languages the installed Vale supports and list gaps in Assumptions);
+    markdownlint-cli2 --config lint/markdownlint.json;
+    optional lychee --offline for relative links and anchors.
+  Convert JSON to SARIF with jq. Write /artifacts/docs.sarif.
+- STE-lite rules (lint/styles/STE/*.yml). ASD-STE100 is a licensed standard and its full
+  dictionary is not free to copy. These are approximations. Do not claim "STE compliant".
+  Say "STE-lite" in output and Assumptions.
+    S1  sentence > 25 words (descriptive) or > 20 words (line starts with an imperative
+        verb or a list number) → warning.
+    S2  paragraph > 6 sentences → warning.
+    S3  passive voice ("is/are/was/were/been/being + past participle") → warning.
+    S4  weak or banned words: just, simply, easily, obviously, basically, actually,
+        very, really, etc., "and so on", "as needed", "if possible", "should" in a
+        procedure, "may want to", utilize, leverage, "in order to", ASAP → warning.
+    S5  marketing words: powerful, seamless, robust, blazing, cutting-edge, best-in-class.
+    S6  idioms and phrasal-verb pairs with a simple verb (set up → configure/install,
+        carry out → do, find out → learn, take out → remove) → note.
+    S7  vague quantity: "a few", "several", "many", "soon", "quickly", "large" with no
+        number or unit → note.
+    S8  one term, many names: flag mixed terms in one file (issue/finding/alert,
+        lockfile/lock file, repo/repository). Term list in styles/STE/terms.yml → note.
+    S9  condition after command ("Run X if Y") in a numbered step → note.
+    S10 noun cluster > 3 nouns → note (heuristic, may be wrong).
+    S11 warning/caution placed after its step → note.
+- Messy-doc rules (markdownlint + custom):
+    D1  heading level skips (h2 → h4), duplicate headings, no top-level heading.
+    D2  code fence with no language; command in prose, not in a code block.
+    D3  line > 120 chars outside code, tables, and URLs; trailing spaces; mixed list markers.
+    D4  broken relative link or missing anchor.
+    D5  README missing: purpose line, setup, run, limits → note.
+    D6  doc mentions a flag, file, or script that does not exist in the repo → warning
+        (grep `--flag`, `path/file.ext` tokens in backticks against the tree).
+    D7  copy-pasted paragraph (jscpd on docs, ≥ 40 tokens) → warning.
+    D8  stale marker: "TODO", "FIXME", "TBD", "coming soon", "WIP" in docs → warning.
+- Comment rules (vale comment scope + Semgrep generic):
+    C1  comment restates the code (`// increment i` above `i++`; same words as the next
+        line, ≥ 80% overlap) → warning.
+    C2  comment > 15 lines in one block, or a function with a comment-to-code ratio > 60% → note.
+    C3  placeholder or noise comments: "fix this", "hack", "magic", "???", "asdf", "foo",
+        "temp", "test123", "stuff", "misc" → warning.
+    C4  commented-out code (≥ 3 lines; same as G7, reported once under G7, not twice).
+    C5  public API (exported function/class, public Java method, public Swift symbol)
+        with no doc comment (Javadoc, TSDoc, DocC, docstring) → note. Skip tests and getters.
+    C6  doc comment out of sync: @param/@return names not in the signature, or `@throws`
+        for an exception not thrown → warning.
+    C7  comment in a language other than the file default (non-ASCII letters in a
+        repo whose comments are all ASCII) → note. Off by default; enable with docs.lang.
+    C8  TODO/FIXME without owner or ticket (`TODO(name)` or `TODO(#123)`) → warning.
+    C9  comment sentence rules S1, S3, S4 apply; skip license headers and annotations.
+- Suppression: `<!-- vale off -->` / `// vale off` allowed. A suppression needs a reason
+  (`vale off: quoted API text`). Without a reason → note, never error.
+- Output: console summary line "docs: N warnings (S:x D:y C:z), non-blocking". Top 10
+  worst files by warnings count in /artifacts/docs.log.
+- Limits (state in Assumptions): heuristics make false positives. Passive-voice and
+  noun-cluster checks are weak. Spelling and grammar are not checked. Docs lint cannot
+  tell if the text is true.
+
+5) GUARDRAILS FOR AI-GENERATED CODE (.ai-review/guardrails.sh + quality.yaml)
+Plain bash + git + jq. Offline. Each guardrail has an id, a message with file:line,
+and a test in tests/guardrails.sh. Run on the diff (diff mode) or the tree (full mode).
+  G1  Hallucinated dependency: every import/require/package in changed files must be
+      declared in a manifest or lock file in the repo, or be stdlib. Every NEW
+      dependency in a manifest must exist in the lock file with a resolved integrity hash,
+      and must be in the allowlist .ai-review/allowed-deps.txt (if the file exists).
+      Typo-squat check: edit distance ≤ 2 from a popular package name = finding.
+      Why: published research (USENIX Security 2025) found roughly 1 in 5 code samples from
+      16 models named a package that does not exist (about 5% for commercial models). Many
+      invented names repeat across runs, so attackers can register them
+      ("slopsquatting"). Offline controls: (a) a new dependency must be in the allowlist
+      or already resolved in the lock file with an integrity hash; (b) the name must exist in
+      the internal mirror index (/cache/mirror-index.txt), not only on the public registry;
+      (c) release-age cooldown: a version younger than 7 days (30 for new packages) in the
+      mirror metadata = finding; (d) package with < 1 year history or no repository link in
+      metadata = finding; (e) install scripts forbidden: `.npmrc` must have
+      `ignore-scripts=true` and `allow-git=none` (a git dependency can ship its own .npmrc
+      and re-enable scripts); builds use `npm ci --ignore-scripts` (or `pnpm install
+      --frozen-lockfile`), never `npm install`; (f) same rules for Maven (checksum/signature
+      verification on, no unknown repositories), pip (`--require-hashes`) and go (GONOSUMDB
+      unset, go.sum present).
+  G2  Hallucinated API: `tsc --noEmit`, `javac` (via mvn/gradle offline, dependencies
+      pre-seeded in /cache), `mypy`, `go vet` must pass. Type or compile failure = finding. Do not skip it.
+      ios: the Linux image cannot compile against Apple SDKs. G2 for ios is NOT RUN in
+      this pipeline. Document it in Assumptions. Require a separate macOS CI job
+      (`xcodebuild build-for-testing`). Do not claim iOS compile coverage.
+  G3  Suppression abuse: any new suppression comment without `rule-id: reason` is a
+      finding. Any change to a lint/CI/config file (eslint, swiftlint, swiftformat, pmd,
+      tsconfig strict flags, .semgrepignore, quality-gate.json, CI workflow) in the same
+      diff as source code is a finding "config change needs human review".
+  G4  Test integrity: new `.skip`, `xit`, `@Disabled`, `@Ignore`,
+      `t.Skip`, `pytest.mark.skip`, `XCTSkip`, disabled tests in .xctestplan; deleted or
+      weakened assertions (net negative `assert/expect` count in a
+      changed test file); tests with no assertion; mocks of the unit under test.
+  G5  Tests accompany code: a changed source file with logic changes needs a changed or
+      new test file in the same diff. Else finding.
+  G6  Diff size: > 400 changed lines or > 15 files in one change = finding "split the
+      change". Limits are in quality-gate.json under "guardrails".
+  G7  Dead and placeholder code: `TODO`, `FIXME`, `XXX`, `pass`-only bodies,
+      `NotImplementedError`, `fatalError("TODO")`, `throw new Error("not implemented")`,
+      `UnsupportedOperationException`, commented-out code
+      blocks ≥ 3 lines, `console.log`/`print`/`System.out` debug output, unused exports.
+  G8  Unsafe patterns AI often writes: `eval`/`exec`, `shell=True`, `innerHTML`,
+      `verify=False`, `rejectUnauthorized:false`, `chmod 777`, `0.0.0.0/0`, `latest` image
+      tags, `http://` URLs, `Math.random` for tokens, `md5`/`sha1` for security,
+      string-built SQL, catch-and-ignore, `except:` bare, `any` casts.
+  G9  Error handling and logging: every external call (http, db, fs, subprocess) has
+      error handling and a timeout. No secrets, tokens, or PII in log statements.
+  G10 Input validation: every new HTTP handler/route validates its input with a schema
+      library already in the manifest (zod, joi, pydantic, bean validation, Codable with
+      validation, etc.). Flag handlers that pass request data to a sink without
+      validation (taint rules).
+  G11 Binary and generated files: no new binary, minified, or vendored file; no file
+      > 1 MB; no lock file edit without a manifest edit (and the reverse).
+  G12 Provenance: a commit with a message trailer or file header marking AI authorship is
+      allowed. The guardrails run the same checks. Never relax a rule for AI or
+      human code.
+  G13 CI and build-file hygiene (workflow files in the diff or tree; zizmor offline mode
+      and actionlint when installed, else Semgrep YAML rules):
+      every `uses:` pinned to a 40-char commit SHA (tag only as a comment); top-level
+      `permissions: {}` or read-only with per-job scopes; no `pull_request_target` or
+      `workflow_run` that checks out PR head code; no `${{ github.event.* }}` / branch /
+      title / body interpolated into `run:` (pass through `env:`); no `secrets: inherit`;
+      no `curl | sh`; no self-hosted runner on public PR triggers; `persist-credentials:
+      false` on checkout; no long-lived cloud keys (use OIDC); no artifacts or caches
+      shared across trust boundaries. Same for GitLab CI / Jenkinsfile / Dockerfile
+      (`USER` set, digest-pinned FROM, no `ADD` of URLs, no secrets in ARG/ENV).
+      These map to OpenSSF Scorecard checks: Dangerous-Workflow, Token-Permissions,
+      Pinned-Dependencies, Binary-Artifacts, Code-Review, Branch-Protection.
+  G14 Untrusted-text and agent-config safety (OWASP LLM01/LLM05/LLM06: generated or fetched
+      text is untrusted input; an agent with too much power is a risk). Findings for:
+      hidden or bidi Unicode (U+202A–202E, U+2066–2069, zero-width characters) in source,
+      docs and agent files (AGENTS.md, CLAUDE.md, .cursorrules, .github/copilot-instructions.md,
+      MCP configs); instructions in comments or docs that tell a tool to ignore rules, disable
+      checks, fetch URLs, run commands or exfiltrate data; agent/MCP config granting broad
+      shell, write, or network permissions or `--dangerously-skip-permissions` style flags;
+      model output written straight into a shell, SQL, HTML, or file path without encoding or
+      validation (improper output handling). A change to an agent-config file needs human review (like G3).
+  G15 Exception handling quality (OWASP 2025 "Mishandling of Exceptional Conditions"):
+      catch-and-ignore, catch that returns success, fail-open authorization on error,
+      `finally` that swallows or throws, error messages that leak stack traces or internals,
+      missing timeouts/retries limits/circuit breakers on remote calls, unbounded retry loops,
+      resource not released on error path, generic `throw new Error()` with no cause.
+  Findings are SARIF (ruleId = guardrail id, level = error). Exit by the shared policy.
+
+6) CODING CONTRACT (the rules AI code must follow before it is written)
+Emit this block as .ai-review/rules/CONTRACT.md content inside the quality.yaml header
+comment AND as a system-prompt snippet in --help output, so a coding agent can read it:
+  - Smallest change that solves the task. Reuse existing helpers; search before adding.
+  - One responsibility per function/class. ≤ 50 lines, ≤ 4 params, nesting ≤ 4.
+  - Depend on abstractions; inject dependencies; no hidden globals.
+  - No duplicated logic; extract at the third copy. No magic numbers or literal URLs.
+  - Handle every error path. Validate every external input. Parameterize every query.
+  - No new dependency without need; prefer stdlib. Never invent an API: verify it exists.
+  - Never edit lint, CI, or gate config to make code pass. Never skip or weaken a test.
+  - Add or update tests for every behavior change. Keep names clear; no abbreviations.
+  - Write docs and comments in short sentences. One idea each. Explain why, not what.
+    No filler words. Keep docs true: update them in the same change as the code.
+
+7) ai-review.sh (host bootstrapper)
+- set -euo pipefail. If docker is missing or the daemon is unreachable, exit 2.
 - cd "$(git rev-parse --show-toplevel)". mkdir -p .ai-review/.cache .ai-review/artifacts.
-- IMAGE="${AI_REVIEW_IMAGE:?set to registry/image@sha256:<digest>}".
+- IMAGE="${AI_REVIEW_IMAGE:-$(cat .ai-review/image.digest 2>/dev/null)}"; empty → exit 2
+  "run .ai-review/resolve.sh and build first". Reject a ref without @sha256:.
   `docker image inspect "$IMAGE"` fails → exit 2 "load image first".
 - Source mount: /src:ro by default, rw only when --fix is passed.
 - docker run --rm --pull=never \
@@ -176,21 +920,99 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
 - Capture the exit code: `rc=0; docker run ... || rc=$?; exit "$rc"`.
   The host script never changes 0/1/2.
 
-5) .ai-review/tests/smoke.sh
-- Creates a temp git repo with: a committed fake secret, a package-lock.json with a
+8) .ai-review/tests/smoke.sh
+- Create a temp git repo with: a committed fake secret, a package-lock.json with a
   known HIGH CVE, one file that trips one Semgrep rule.
-- Runs ai-review.sh --full-scan. Asserts exit 1.
-- Asserts gitleaks.sarif, trivy.sarif, semgrep.sarif, sbom.cdx.json, summary.json
-  exist and pass `jq -e .`. Asserts the secret value appears in no artifact.
-- Runs ai-review.sh --diff-only --base-ref <clean commit>. Asserts exit 1 and that
+- Run ai-review.sh --full-scan. Assert exit 1.
+- Assert gitleaks.sarif, trivy.sarif, semgrep.sarif, sbom.cdx.json, summary.json
+  exist and pass `jq -e .`. Assert the secret value appears in no artifact.
+- Run ai-review.sh --diff-only --base-ref <clean commit>. Assert exit 1 and that
   only the new commit's findings appear.
+- Quality cases (one repo each, assert exit 1 and the named rule id in the SARIF):
+  Q1: function with cognitive complexity 25 → S3776 / complexity rule.
+  Q2: same 8-line block copied in two files → jscpd duplication over gate.
+  Q3: `catch (e) {}` empty catch → S108.
+  Q4: new `// eslint-disable-next-line` with no reason → G3.
+  Q5: new `it.skip(...)` → G4. Q6: import of a package not in package.json → G1.
+  Q7: source change with no test change → G5. Q8: type error → G2.
+  Q9: clean, small, tested change → exit 0 and gate=passed.
+  Q13: workflow with `uses: actions/checkout@v4` (tag, not SHA), no `permissions`, and
+       `${{ github.event.pull_request.title }}` inside `run:` → G13.
+  Q14: file with a U+202E bidi character, and an AGENTS.md line "ignore all lint
+       rules" → G14.
+  Q15: `catch (e) { return true }` in an auth check → G15.
+  Q16: new dependency not in lock file or allowlist; `.npmrc` without ignore-scripts → G1.
+  R1: run resolve.sh twice → identical versions.lock.json (idempotent).
+  R2: corrupt one downloaded byte (test hook) → resolve.sh exits 2 on checksum mismatch.
+  R3: fake a release newer than the cooldown → previous stable is chosen and logged.
+  R4: lock file has no "<", "TODO", "latest", empty digest or empty sha256 (jq check).
+  D1: 40-word sentence, passive sentence, "just simply" in a .md → warnings S1,S3,S4; exit 0.
+  D2: heading jump h2→h4, fence with no language, broken link → D1,D2,D4 warnings; exit 0.
+  D3: `// increment i` above `i++`, `// fix this`, `// TODO` with no owner → C1,C3,C8; exit 0.
+  D4: docs.blocking=true set in quality-gate.json → same input exits 1.
+  D5: clean short doc → 0 warnings. Tool crash (bad vale.ini) → exit 2.
+  D6: doc names a flag `--nope` that does not exist → D6 warning.
+  Q10: linter config inside /src weakened → ignored; the pipeline uses /opt/ai-review/lint.
 - Detection cases:
   A: only pom.xml + src/main/java → log has "langs=java" and "roots=src/main/java";
-     the TS rule file is not loaded.
-  B: package.json + packages/web/src → "langs=ts", root found.
+     the javascript and swift rule files are not loaded.
+  B: package.json + packages/web/src → "langs=js", root found.
   C: repo of only .txt files → "generic rules only", semgrep exit 0.
   D: --lang python on the Java repo → "source=flag", python rules loaded.
+  E: Package.swift + Sources/ → "langs=ios", roots=Sources, SwiftLint ran, ESLint did not.
+  G: package.json with react + src/App.tsx → "langs=js,react", react.yaml loaded, jsx-a11y ran.
+  F: pom.xml + package.json + *.xcodeproj → "langs=java,js,ios".
+  Q12: React: useEffect missing dependency, array index as key, dangerouslySetInnerHTML with
+       props, token in localStorage, <a target="_blank"> without rel, click handler on <div> → each flagged.
+  Q11: `let x = y!` force unwrap and `NSAllowsArbitraryLoads=true` in Info.plist → both flagged.
+
+9) CI INTEGRATION (the tool wires itself into the CI the repo already uses)
+Contract for every CI: fetch base branch → run ./ai-review.sh → read exit code (0/1/2)
+→ upload SARIF + artifacts. No CI-specific logic lives in pipeline.sh.
+- `./ai-review.sh --init-ci [auto|github|gitlab|generic] [--write]`:
+  - auto: detect from repo files, first match wins, log "ci detected: <name>":
+      .github/workflows/        → github
+      .gitlab-ci.yml            → gitlab
+      Jenkinsfile               → generic (emit a stage snippet)
+      bitbucket-pipelines.yml, azure-pipelines.yml, .circleci/config.yml,
+      .buildkite/              → generic (emit a step snippet)
+      none found                → generic, plus print "no CI found".
+    If no CI file exists, also read the remote URL (`git remote get-url origin`):
+    github.com → github, gitlab → gitlab.
+  - Without --write: print the snippet and the target path (dry run, default).
+  - With --write: create a NEW file only (.github/workflows/ai-review.yml,
+    .gitlab/ai-review.gitlab-ci.yml + one `include:` line printed for the user to add).
+    Never edit or overwrite an existing CI file. Existing target → exit 2 with the path.
+- Templates in .ai-review/ci/ must follow guardrail G13: actions pinned by full SHA
+  (resolved by resolve.sh from the action's latest release tag, tag kept as a comment),
+  `permissions: {}` then per-job minimum, no `pull_request_target`, no untrusted
+  `${{ }}` in `run:`, `persist-credentials: false`, `fetch-depth: 0`.
+- Each template must do, per provider:
+  github:  trigger pull_request + push to default branch; `git fetch origin $BASE_REF`;
+           run diff mode on PRs, full scan on push to default and on a weekly schedule;
+           upload each *.sarif with github/codeql-action/upload-sarif (category = tool name),
+           needs security-events: write; upload artifacts; job summary from summary.json;
+           fork PRs: run without secrets, never use pull_request_target.
+  gitlab:  merge_request_event + default branch; `git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME`;
+           artifacts: paths .ai-review/artifacts/, `reports: sast` for semgrep SARIF→ gl-sast
+           conversion only if a verified converter exists (else keep SARIF as plain artifacts
+           and say so); allow_failure false; cache key = trivy db date.
+  generic: a POSIX sh script that does fetch, run, archive, and maps exit 1 and 2 to a failed
+           build. Include copy-paste snippets for Jenkins, Bitbucket, Azure, CircleCI as
+           comments, each marked UNTESTED unless smoke-tested.
+- --init-ci prints runner requirements: Docker, the image (by digest from image.digest
+  or AI_REVIEW_IMAGE), the lock file, and a fresh .ai-review/.cache/trivy. Also emit a
+  scheduled-job snippet that re-runs resolve.sh and opens a PR with the lock-file diff.
+- Image delivery in CI: pull by digest from the registry, or `docker load` an artifact.
+  Do not build the image inside the scan job.
+- Branch protection: print (do not apply) the settings that make the check required.
+- Smoke tests: I1 repo with .github/workflows → "ci detected: github" and a dry-run
+  snippet with SHA-pinned actions only (grep: no `@v`, no `@main`). I2 .gitlab-ci.yml → gitlab.
+  I3 no CI file → generic. I4 --write on an existing target → exit 2, file unchanged.
+  I5 --write on a clean repo creates exactly one new file.
 
 ACCEPTANCE
-Zero placeholders. Every Validate command listed. Every assumption listed.
-smoke.sh is the definition of done.
+Zero placeholders. Every Sonar-equivalent rule in 4a maps to a real rule id in a named
+tool, listed in Assumptions. Write a rule with no real equivalent as a Semgrep rule
+with a fixture. Do not claim coverage that is not implemented. List every Validate command.
+List every assumption. smoke.sh is the definition of done.
