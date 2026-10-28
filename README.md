@@ -1,7 +1,7 @@
 # ci — AI code verification pipeline
 
-One offline container. Scans AI-written and human code for security and quality problems
-before merge. Works with any coding flow and any CI.
+One offline container. Scans AI-written and human code before merge on 4 axes: security,
+reliability, maintainability, tests. Works with any coding flow and any CI.
 
 > **Status:** this repo has the spec only: [`llm.txt`](llm.txt). A coding agent builds
 > the pipeline from it. Nothing has run yet. Trust only what `.ai-review/tests/smoke.sh` proves.
@@ -12,12 +12,16 @@ before merge. Works with any coding flow and any CI.
 - Dependencies, SBOM: Trivy
 - SAST: Semgrep with local rules
 - Lint, quality: ESLint, PMD, SpotBugs, Error Prone, SwiftLint, Ruff, golangci-lint, jscpd
-- Quality gate: Sonar-style, on new code
+- Quality gate: Sonar-style, on new code. One status per axis. Any failed axis fails the run.
 - AI guardrails (G1–G15): fake packages, hidden lint disables, weak tests, CI hardening
 - Docs and comments: STE-lite lint with Vale and markdownlint. Warnings only. Never blocks.
 
 Stacks: Java, JS/TS, React, iOS, Python, Go.
-Exit codes: `0` clean, `1` findings, `2` error. Reports: SARIF in `.ai-review/artifacts/`.
+Exit codes: `0` clean, `1` findings, `2` error. Reports: SARIF and `summary.json` in
+`.ai-review/artifacts/`.
+
+In CI, rules and config come from the image and the base branch, not from the pull
+request (PR). Limits apply. See `llm.txt` section TRUST MODEL.
 
 ## Setup
 
@@ -25,13 +29,24 @@ No manual values. The tool finds them.
 
 1. Give `llm.txt` to a coding agent. Example: `claude "Follow llm.txt exactly."`
    Reply `next` after each file. Review each file.
+   To build fewer stacks, add `stacks=java,js` to the prompt.
 2. Run `.ai-review/resolve.sh`. It finds the latest versions, URLs, digests, checksums.
    It verifies them. It writes `versions.lock.json`. Commit it. Review the diff.
 3. Run `.ai-review/build.sh`. It builds and signs the image. It writes `.ai-review/image.digest`.
+   Then it finds your CI and asks one question: add the scan to CI? See [Add to CI](#add-to-ci).
 4. Run `bash .ai-review/tests/smoke.sh`. It must pass.
 
-Needs: Docker, git, bash, jq, gh, cosign. Network is needed for steps 2–3 only.
-The scan is offline.
+Host tools: you install nothing by hand. Each script runs `.ai-review/doctor.sh` first.
+It finds your OS and package manager. It installs missing tools after one `[y/N]` prompt.
+Rules and limits: `llm.txt` section P.
+
+```bash
+.ai-review/doctor.sh --plan    # show missing tools, change nothing
+.ai-review/doctor.sh --yes     # install with no prompt (CI, agents)
+```
+
+Windows: run `wsl --install` in an admin PowerShell first. Then use the Ubuntu shell.
+Network is needed for steps 2–3 only. The scan is offline.
 
 ## Run
 
@@ -46,13 +61,21 @@ For diff mode: run `git fetch origin main` first. Commit your changes first.
 
 ## Add to CI
 
+`build.sh` asks this for you. To do it by hand later:
+
 ```bash
 ./ai-review.sh --init-ci           # detect GitHub, GitLab, other. Print snippet.
 ./ai-review.sh --init-ci --write   # create one new CI file. Never edit old files.
 ```
 
 Any CI: fetch base branch, run `./ai-review.sh`, fail on exit 1 or 2, upload SARIF.
-Make the check required in branch protection.
+Make the check required in branch protection. `--init-ci` prints the CODEOWNERS lines.
+
+A weekly publish job refreshes versions and the Trivy database. It builds, signs and
+pushes the image. Then it opens a PR. A human merges it.
+
+Existing repo with old findings: run a full scan, then `./ai-review.sh --update-baseline`
+one time. Commit `.ai-review/baseline.json`. New findings still fail.
 
 ## Use with an AI agent
 
@@ -64,7 +87,22 @@ Do not edit lint, CI, or gate config to pass."*
 
 - iOS compile check needs macOS. Objective-C and Kotlin: not covered.
 - Static analysis does not replace review, tests, or threat modeling.
-- Rule names change between tool versions. The agent must check each name.
+- Rule names change between tool versions. Smoke case R5 checks each name.
+- On GitHub, a PR can edit its own workflow file. Only CODEOWNERS review and an org
+  ruleset stop that. The tool prints them. It cannot apply them.
+- Fork PRs and private repos without GitHub Advanced Security: no SARIF upload.
+  Artifacts and the exit code stay.
+- The scan runs no tests. Pass the CI coverage report with `--coverage`. Without it, the
+  tests axis is `not_evaluated`.
+- Diff mode misses a finding on an unchanged line that a change breaks. The weekly full
+  scan finds it.
+- A PR that adds a Java dependency needs a cache seed from a trusted branch.
+- A PR that adds any dependency must also add it to `.ai-review/allowed-deps.txt`.
+  A code owner reviews it. The scan cannot check its age or history offline.
+- Type checks need installed dependencies. Install them before the scan, with scripts off.
+- The publish PR needs a GitHub App token, or the required check does not start on it.
+- Library and architecture choices (for example "Redux Toolkit only") are advisory.
+  They do not fail the run.
 
 ## License
 

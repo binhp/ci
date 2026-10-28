@@ -1,24 +1,94 @@
+This file is the full spec a coding agent follows to build the AI code verification pipeline.
+
 ROLE
 Principal DevSecOps Architect. Standards: CIS Docker Benchmark v1.6, SLSA Build L2,
 OWASP Top 10 2025 (and 2021 for old rule ids), OWASP ASVS 5.0, OWASP MASVS (ios/react-native),
 CWE Top 25 (2025), NIST SSDF SP 800-218, OWASP Top 10 for LLM Applications 2025.
 Write production code, not examples.
 
+MAP (read this first; it keeps a long spec in focus)
+Core sections. Read them before every file: GOAL, TRUST MODEL, GLOBAL RULES, EXIT POLICY,
+DELIVERY, ACCEPTANCE. Then read only the sections for the file you write:
+  doctor.sh                         P, 7 (limits), 8 (P cases)
+  resolve.sh, schema/versions.lock  R, P (callers), 1 (what the build reads), PROFILE: JAVA (--seed-java)
+  build.sh                          R, 1, 9 (auto-offer, publish job)
+  Dockerfile                        1, R (lock file keys)
+  pipeline.sh, schema/summary       2, 4c, 4g, 4h, 5 (G3 list), 7 (stages)
+  guardrails.sh, tests/guardrails   5, 4c (guardrails block), 4h
+  quality-gate.json, baseline.json  4c
+  lint/*                            4a, 4b, 4c (threshold map), 4g, the PROFILE section
+  rules/registry.json               4h, then every rule section it lists
+  rules/*.yaml, .semgrepignore      3, 4a, 5, the PROFILE section
+  ai-review.sh                      7, 2 (flags), 9 (--init-ci), 6 (--help contract)
+  tests/smoke.sh                    8, 9 (I cases), ACCEPTANCE
+  ci/*                              9, 5 (G13), TRUST MODEL
+  a profile's files                 PROFILES, then the whole PROFILE: <STACK> in section 10
+After each file, check it against the core sections again. If a section conflicts with a
+core section, the core section wins. Report the conflict in Assumptions.
+Spec changes: edit the rule in its one section.
+Add or change its smoke case in the same change. Do not copy a rule into a second section. Point to it.
+
+PROFILES (one section per stack in section 10; this section holds the common pattern)
+  stack   section           covers
+  java    PROFILE: JAVA     Java: Maven, Gradle, Spring/Jakarta, Lombok, JPA
+  js      PROFILE: JS       JavaScript, TypeScript: Node, browser, Express, NestJS
+  react   PROFILE: REACT    React, Next.js, Vite, React Native (on top of PROFILE: JS)
+  ios     PROFILE: IOS      Swift, SwiftPM, CocoaPods
+  python  PROFILE: PYTHON   Python
+  go      PROFILE: GO       Go
+Common pattern. Each PROFILE section has these parts, in this order:
+  SCOPE, OUTPUT FILES, TOOLS, EXIT CODES, LINT CONFIG, SEMGREP RULES,
+  PROFILE RULES, SMOKE CASES, LIMITS.
+Each profile must:
+  - add rules only. It does not change a core section, the 4c thresholds or the exit policy.
+  - use the numbers in quality-gate.json (4c). It has no thresholds of its own.
+  - give each rule a registry row (4h) with one axis, and one fixture.
+  - read config only from /opt/ai-review/lint (TRUST MODEL).
+  - map each tool exit code to 0/1/2 (EXIT POLICY).
+  - have at least one smoke case per axis it checks.
+  - state in LIMITS what it does not check.
+Detection stays in section 2 (detect_project). A stack detected with its profile
+not selected → log "profile not selected: <stack>"; scan it with generic rules only.
+Add a stack: add a PROFILE: <STACK> section with this pattern. Add its detection line to section 2
+and a row to this table. Do not change other profiles.
+
 GOAL
-Harden the 6-in-1 AI code-review pipeline.
-SUPPORTED STACKS: java, js (JavaScript and TypeScript, Node and browser), ios (Swift,
-SwiftPM, CocoaPods), python, go. react is a sub-profile of js (detected from package.json, section 4f).
-Java, js and react get the deepest rules (sections 4d, 4e, 4f).
-ios, python and go get the baseline in 4a-4c.
-The pipeline verifies AI-generated code on two axes: SECURITY (secrets, CVEs, SAST) and QUALITY
-(lint, Sonar-style rules, complexity, SOLID, DRY, tests). A quality or guardrail
-violation fails the run like a finding.
+Harden the AI code-review pipeline. It joins 6 scan groups in one run: secrets,
+dependencies and SBOM, SAST, lint and quality rules, AI guardrails, docs lint.
+SUPPORTED STACKS: java, js, react (sub-profile of js), ios, python, go. One PROFILE
+section per stack (PROFILES, section 10). The other sections hold every rule that is not
+stack-specific.
+The pipeline verifies AI-generated and human code on 4 axes. Together they form the
+quality gate (section 4c):
+  security        secrets, CVEs, SAST, supply chain, CI hardening, agent-config safety.
+  reliability     bugs, null and error handling, compile and type errors, timeouts.
+  maintainability complexity, size, duplication, SOLID, dead code, naming.
+  tests           coverage on new code, test integrity, tests that go with code changes.
+Each rule belongs to one axis (registry, section 4h). A failure on any axis fails the run.
 The pipeline must run offline (air-gapped), non-root, read-only. It must produce SARIF reports for CI
 upload. It must detect the project language and source roots at runtime. Do not hardcode **/src.
 
+TRUST MODEL
+- Trusted: the image (by digest, signed), the base branch, files reviewed by a CODEOWNER.
+- Untrusted: the PR or diff under scan, everything in /src, build output, tool output
+  derived from repo code, the CI cache written by a PR job.
+- Rules:
+    1. The code under scan cannot change the rules that judge it. Rules, lint config,
+       ignore files and the gate come from the image. Data files come from the base commit.
+    2. Repo code that runs (the Java build) runs in a separate container (stage 1). It
+       cannot write summary.json or SARIF. Limit: it can fake its own compile result;
+       G3 makes a human review each build-logic change (section 7).
+    3. Git in the container runs no hooks and no fsmonitor.
+    4. The trivy DB and package data are inside the image. No writable cache can change them.
+    5. On a PR, CI runs only base-branch copies of ai-review.sh, doctor.sh, image.ref and
+       versions.lock.json (section 9).
+- Limit: on GitHub `pull_request`, a PR can edit the workflow file. Only CODEOWNERS review
+  and an org ruleset or required workflow stop that (section 9). State it in --help.
+
 INPUTS — NONE REQUIRED. The agent resolves every version, URL, digest and checksum itself.
-It queries upstream at generation time (rule R below). I may supply OPTIONAL overrides.
+It queries upstream at generation time (rule R below). The user may supply OPTIONAL overrides.
 A missing override is never a reason to stop or ask.
+A missing host tool is never a reason to stop or ask. Section P detects and installs it.
 Optional overrides (defaults as shown):
   - distro: alpine | debian-slim            (default: debian-slim; JDK/Node/SwiftLint need glibc)
   - mirror base URL                         (default: none = upstream; with a mirror, fetch the same
@@ -26,16 +96,15 @@ Optional overrides (defaults as shown):
   - pin overrides: TOOL=x.y.z               (default: latest stable passing the cooldown)
   - release cooldown days                   (default: 7)
   - quality thresholds                      (default: section 4c)
+  - stacks: java,js,react,ios,python,go     (default: all; the agent builds only these profiles)
 Tools to resolve (the agent finds the official release source of each):
   secrets: gitleaks. deps/SBOM: trivy. SAST: semgrep (pip, hash-pinned) + rules in this repo.
   docs: vale, markdownlint-cli2 (+ lychee optional, offline link check).
-  js: eslint + plugins, typescript-eslint, typescript, dependency-cruiser, jscpd (npm).
-  java: PMD, Checkstyle, SpotBugs + find-sec-bugs + fb-contrib, Error Prone + NullAway,
-  ArchUnit, Spotless (Maven Central). ios: SwiftLint, SwiftFormat (GitHub releases).
-  python: ruff, bandit, mypy (PyPI). go: golangci-lint. CI: zizmor, actionlint.
+  duplication: jscpd (npm). CI: zizmor, actionlint.
+  Per stack: TOOLS in each PROFILE section.
   Do not use SonarQube/SonarScanner (needs a server). Use the Sonar-equivalent rules in section 4.
 
-R) AUTO-RESOLUTION (replaces all manual input; the agent runs it, I do not)
+R) AUTO-RESOLUTION (replaces all manual input; the agent runs it, not the user)
 Deliver .ai-review/resolve.sh (host, needs network, run once and on a schedule). It writes
 .ai-review/versions.lock.json (committed, reviewed in a PR like any dependency bump).
 Dockerfile build args, ai-review.sh and README READ the lock file.
@@ -66,8 +135,23 @@ Dockerfile build args, ai-review.sh and README READ the lock file.
   `stable-slim`) to its digest with `docker buildx imagetools inspect` (or `crane digest`).
   Write `image@sha256:…` into the lock file. If the image has a cosign signature, verify it.
 - Trivy DB: run `trivy image --download-db-only` and `--download-java-db-only` into
-  .ai-review/.cache/trivy. Record DB `UpdatedAt` in the lock file. If the DB is older than
-  7 days, fail the later scan (exit 2) (override: AI_REVIEW_MAX_DB_AGE_DAYS).
+  .ai-review/.cache/trivy. Record DB `UpdatedAt` and the SHA256 of each DB file in the lock
+  file. build.sh bakes the DB into the image (section 1). If the DB is older than
+  14 days, fail the later scan (exit 2) (override: AI_REVIEW_MAX_DB_AGE_DAYS). The publish
+  job (section 9) rebuilds weekly. 14 days gives 7 days to merge its PR. After 10 days,
+  the scan prints a warning "trivy DB is <n> days old: merge the publish PR".
+- OS package snapshot: record a snapshot.debian.org timestamp (or the Alpine repository
+  tag) in the lock file. The Dockerfile installs OS packages from it.
+- Package data for G1: write .ai-review/.cache/data/<ecosystem>-index.json and
+  <ecosystem>-top.txt (section 5, G1). Record each source URL and SHA256 in the lock file.
+- Signing identity: record the cosign keyless identity (issuer, subject regex) of the
+  publish job in the lock file. CI verifies the image against it.
+- `--seed-java`: fill the Java cache (PROFILE: JAVA, PROFILE RULES). Run it only on a trusted ref.
+- Lock file schema: .ai-review/schema/versions.lock.schema.json. resolve.sh validates its
+  output against it before it writes. Top-level keys: schema_version, generated_at,
+  cooldown_days, base_image, os_snapshot, tools[], npm, pypi, maven, actions[], trivy_db,
+  data[], signing. Each tool: {name, version, published_at, url, sha256, signature:
+  verified|none, source}.
 - Runtime image ref: after `docker buildx build`, write the digest to
   .ai-review/image.digest. ai-review.sh reads AI_REVIEW_IMAGE, else that file. Nobody types it.
 - Idempotent: if upstream is unchanged, two runs of resolve.sh produce an identical lock
@@ -76,90 +160,202 @@ Dockerfile build args, ai-review.sh and README READ the lock file.
   URL and the reason. Retry 3 times with backoff on 5xx/429 only.
 - Do not invent a value. Do not write a value not obtained from a live query in this run.
 
-OUTPUT TREE (exactly these files, nothing else)
+P) HOST PREREQUISITES (auto-detect, auto-install; the user needs no prior knowledge)
+Deliver .ai-review/doctor.sh. It finds each host tool the pipeline needs. It installs the
+missing ones or prints exact steps for this OS. The user does not read a list or pick a package.
+- Callers. resolve.sh, build.sh, ai-review.sh, tests/smoke.sh and `--init-ci` run
+  `.ai-review/doctor.sh --need <phase>` first. Non-zero → stop with the same code.
+  Do not keep a second tool list in any other file.
+- Flags: --need resolve|build|scan|ci|all (default all). --plan (print only, change nothing).
+  --yes (install with no prompt, for CI and agents). --json (machine output). -h/--help.
+- Detect the host. Do not ask the user:
+    OS:      `uname -s` → Darwin | Linux | MINGW*/MSYS*/CYGWIN* (native Windows).
+    Distro:  `ID` and `ID_LIKE` from /etc/os-release. WSL2: "microsoft" in /proc/version.
+    Arch:    `uname -m` → amd64 | arm64.
+    Manager: first found of brew, apt-get, dnf, yum, apk, pacman, zypper.
+    Rights:  root, or `sudo -n true` works, or no sudo.
+    Network: one HTTPS HEAD to the first upstream in the lock file (or github.com), 5 s timeout.
+    CI:      `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `JENKINS_URL` set → non-interactive.
+- Tools per phase. Build this table from the commands the other files run on the host.
+  Do not copy it from README. Each tool counts as present only if its version command passes:
+    scan:    bash, git, docker (daemon reachable: `docker info`).
+    ci:      scan tools.
+    build:   scan tools, docker buildx, cosign.
+    resolve: build tools, curl, jq, gh, tar, a SHA256 tool, crane (only if buildx
+             imagetools is missing). npm, pip-compile, mvn: only for stacks found by
+             detect_project() (section 2), and only if resolve.sh runs them on the host.
+             If resolve.sh runs them in a pinned container, do not list them.
+  ci also needs cosign (image signature check, section 9).
+  Minimum version per tool = the first release with every flag and subcommand the scripts
+  use (for example `gh attestation verify`, `docker buildx imagetools`). Read it from the
+  tool's release notes at generation time. Record it and the source URL in Assumptions.
+  If a tool is older, treat it as missing.
+- Host scripts (doctor.sh, resolve.sh, build.sh, ai-review.sh, smoke.sh) run on bash 3.2
+  (macOS default). No `declare -A`, no `mapfile`, no `${x,,}`. SHA256: `sha256sum`, else
+  `shasum -a 256`. No GNU `timeout` on the host. These rules remove three prerequisites.
+- Install order for one missing tool. Stop at the first step that works:
+    1. OS package manager. Map tool → package name per manager in one table in doctor.sh.
+       Confirm the package exists before the plan (`brew info --json=v2`, `apt-cache policy`,
+       `dnf info`, `apk search -e`, `pacman -Si`, `zypper info`). Do not guess a name.
+    2. Official release binary: resolve it with rule R (latest stable, cooldown, SHA256 vs.
+       published checksums, signature where published). Install to "$HOME/.local/bin".
+       No sudo. If that directory is not on PATH, print the one line to add to the shell rc.
+    3. Neither works → print the official install page URL and the exact commands. Exit 2.
+- Special cases:
+    macOS, no brew: download the Homebrew .pkg from the Homebrew GitHub release with rule R.
+      Install it with `sudo installer -pkg <file> -target /`. If no .pkg asset exists, use
+      step 3. Do not run the `curl | bash` one-liner.
+    macOS, no docker: install the colima, docker and docker-buildx formulae. Run
+      `colima start --cpu <n> --memory <GiB>` with n ≥ AI_REVIEW_CPUS + 1 and GiB ≥
+      AI_REVIEW_MEMORY + 2 (section 7). If colima runs with less, print the restart command.
+      Reason: Docker Desktop needs a GUI license accept on the first run. If Docker Desktop
+      is present but stopped, run `open -a Docker` and wait 60 s for `docker info`.
+    Linux, docker present, daemon stopped: `sudo systemctl start docker` (systemd), else
+      print the start command for the init system found.
+    Linux, docker socket denied: `sudo usermod -aG docker "$USER"`. Tell the user to log in
+      again, or run `newgrp docker`. Rootless Docker counts as present.
+    Linux, no docker: distro package (docker.io, moby-engine or docker). If the distro has no
+      package, use step 3 with the Docker Engine page for that distro.
+    gh not logged in and GH_TOKEN, GITHUB_TOKEN unset: in a TTY, run `gh auth login --web`.
+      In CI, exit 2 with "set GH_TOKEN". Only the resolve phase needs this.
+    Native Windows (MINGW/MSYS/CYGWIN): do not install. Print the WSL2 steps: run
+      `wsl --install` in an admin PowerShell, restart, open the Ubuntu shell, run the script
+      again there. Exit 2.
+    No network: do not install. Print the plan and the mirror override (INPUTS). Exit 2.
+      The scan phase is offline. It needs no install if the image is loaded.
+- Consent. Print the full plan first: tool, found version, action, exact command.
+    No change needed → exit 0, no prompt.
+    TTY, no --yes → ask one question: "Install N tools? [y/N]". Default no.
+    Non-TTY, no --yes → do not install. Print the plan. Exit 2.
+    --yes → install. Print each command before it runs. Do not hide sudo.
+    CI scan jobs use --plan only (section 9). They do not install.
+  Do not install anything the phase does not need. Do not upgrade a tool that passes.
+- After the installs, run the detection again. A tool still missing → exit 2 with its fix.
+- Output: a table on stderr (tool | need | found | status | fix). With --json, the same
+  data on stdout. The script writes .ai-review/.cache/doctor.json (OS, arch, manager, tools).
+- Exit policy: 0 = all present, 2 = a tool is missing or did not install. No other code.
+- Idempotent: a second run on a ready host prints "ready" and changes nothing.
+- Limits. State them in --help and in Assumptions:
+    `gh auth login` needs the user once, unless GH_TOKEN is set.
+    Docker group membership starts only after the user logs in again.
+    Package-manager tools are not hash-pinned like lock-file tools. Trust = the manager's
+    signed index. Release-binary installs (step 2) are hash-checked.
+    Native Windows without WSL2 is not supported.
+
+OUTPUT TREE (exactly these files plus the OUTPUT FILES of each selected profile, nothing else)
+.ai-review/doctor.sh                (host: detects + installs host tools, section P)
 .ai-review/resolve.sh               (host: resolves + verifies latest versions)
-.ai-review/build.sh                 (host: buildx from the lock file, cosign sign, writes image.digest)
+.ai-review/build.sh                 (host: buildx from the lock file, writes image.digest, offers CI
+                                     setup; in the publish job also pushes and signs, section 9)
 .ai-review/versions.lock.json       (generated by resolve.sh, committed)
-.ai-review/image.digest             (generated by the build, git-ignored)
+.ai-review/schema/versions.lock.schema.json
+.ai-review/schema/summary.schema.json
+.ai-review/image.digest             (generated by a local build, git-ignored)
+.ai-review/image.ref                (registry image@sha256, committed, written by the publish job)
+.ai-review/baseline.json            (accepted legacy findings, section 4c; starts empty: [])
+.ai-review/allowed-deps.txt         (dependency allowlist, G1; starts with the lock-file names)
+.ai-review/hotspots-reviewed.json   (reviewed hotspot fingerprints, section 4c; starts [])
 .ai-review/Dockerfile
 .ai-review/pipeline.sh
 .ai-review/guardrails.sh
 .ai-review/quality-gate.json
-.ai-review/lint/eslint.config.mjs
-.ai-review/lint/ruff.toml
-.ai-review/lint/golangci.yml
-.ai-review/lint/.swiftlint.yml
-.ai-review/lint/.swiftformat
-.ai-review/lint/pmd-ruleset.xml
-.ai-review/lint/checkstyle.xml
 .ai-review/lint/jscpd.json
 .ai-review/lint/vale.ini
 .ai-review/lint/styles/STE/*.yml     (STE-lite rules, section 4g)
 .ai-review/lint/markdownlint.json
+.ai-review/lint/gitleaks.toml
+.ai-review/lint/gitleaksignore       (empty; replaces any repo .gitleaksignore)
+.ai-review/lint/trivy.yaml
+.ai-review/lint/trivyignore          (empty; replaces any repo .trivyignore)
 .ai-review/tests/docs/               (one good + one bad fixture per docs rule)
-.ai-review/lint/tsconfig.base.json
-.ai-review/lint/depcruise.cjs
-.ai-review/lint/archunit/            (default ArchUnit rule set, Java)
+.ai-review/rules/registry.json       (one row per rule, section 4h)
 .ai-review/rules/quality.yaml        (always on: SOLID, DRY, maintainability, AI-slop)
 .ai-review/rules/generic.yaml        (always on)
-.ai-review/rules/javascript.yaml     (JS and TS)
-.ai-review/rules/react.yaml          (loaded when react is detected, on top of javascript.yaml)
-.ai-review/rules/java.yaml
-.ai-review/rules/swift.yaml           (iOS)
-.ai-review/rules/python.yaml
-.ai-review/rules/go.yaml
 .ai-review/.semgrepignore
 .ai-review/tests/<rule-id>.{js,ts,tsx,jsx,java,swift,py,go}   (one fixture per rule)
 .ai-review/tests/guardrails.sh        (one failing + one passing case per guardrail)
 .ai-review/tests/smoke.sh
 ai-review.sh                          (also implements --init-ci, section 9)
 .ai-review/ci/github.yml              (template, SHA pins filled by resolve.sh)
-.ai-review/ci/gitlab.yml
+.ai-review/ci/gitlab.yml              (scan jobs + scheduled publish job)
+.ai-review/ci/publish.yml             (GitHub publish job, section 9)
 .ai-review/ci/generic.sh              (any other CI: Jenkins, Bitbucket, Azure, CircleCI, Buildkite)
 .gitignore (append three lines: .ai-review/.cache/, .ai-review/artifacts/, .ai-review/image.digest)
 
 DELIVERY
-Send one file per message, in tree order. Wait for "next" before each file.
-Each message contains:
+Send the common files first, in tree order. Then each selected profile's files, in
+PROFILES table order. Send files in tree order. Wait for "next" before each message. One file per message,
+except: send up to 4 config files of < 80 lines each in one message (lint/*, schema/*,
+the starter data files). Each file still gets its own Assumptions and Validate block.
+Before the first file, detect this host with the section P rules. Do not ask the user for
+the OS or the tools. Report OS, arch, manager and each tool found or missing.
+Before each "## Validate" block, install the missing tools with the section P order.
+Ask before sudo. If a tool cannot be installed, mark each command that needs it NOT RUN
+(missing: <tool>; fix: <command>).
+Each message contains (WRITING STYLE applies):
   a) "## Assumptions": tool version → exact subcommands/flags used
   b) the complete file
   c) "## Validate": exact commands, each marked RAN / NOT RUN (reason)
 The last message ends with:
   - "## Build": docker buildx build --provenance=true --sbom=true --platform linux/amd64
-    --build-arg … ; cosign sign <digest>; write the digest to .ai-review/image.digest (no manual copy).
+    --build-arg … ; write the digest to .ai-review/image.digest (no manual copy). Local
+    builds are SLSA L1 at most. Signed L2 builds come from the publish job (section 9).
+  - "## CI": run `./ai-review.sh --init-ci auto` and show the result. Ask the user one
+    question: add it to CI now? If yes, run it with --write. Mark each command RAN / NOT RUN.
   - Threat-model table: risk → control → file:line → SSDF group (PO/PS/PW/RV, NIST SP
-    800-218) → OWASP Top 10 2025 category. Add a SLSA row: the build level claimed (L2 needs
-    signed provenance from a tamper-resistant build platform) and the evidence. Do not
-    claim without evidence.
+    800-218) → OWASP Top 10 2025 category → axis. One row per TRUST MODEL rule.
+    Add a SLSA row: level claimed and evidence. L2 needs signed provenance from a
+    tamper-resistant build platform. Do not claim without evidence.
 
 GLOBAL RULES
 - No placeholders, no TODOs, no "…", no `|| true`, no `curl | sh`.
 - Scripts: shellcheck clean. Dockerfile: hadolint clean. YAML: yamllint clean.
 - No tool reads from the network at scan time.
 - Every tool skips .ai-review/ (its own cache and reports).
+- No tool reads a config or ignore file from the scanned repo (TRUST MODEL).
 - Diff mode scans committed HEAD only. Say so in --help.
 - Detect language and scan roots at runtime. Do not hardcode **/src.
+- Writing style: every message, --help text, log line, error message and comment in the
+  generated files follows WRITING STYLE below.
 
-EXIT POLICY (shared by both scripts; host script passes it through unchanged)
+WRITING STYLE (STE plus caveman, source <https://github.com/juliusbrussee/caveman>, Apache-2.0)
+This section is the source for the style rules. A repo AGENTS.md links here. It does not copy them.
+- Answer first: `[thing] [action] [reason]. [next step].`
+  Write "trivy DB stale: 16 days. Run resolve.sh." Do not write "It seems that the DB...".
+- One idea per sentence. Procedure sentence ≤ 20 words. Descriptive sentence ≤ 25 words.
+  Active voice. Condition before command. One word for one thing.
+- Drop: articles in lists and messages, greetings, "let me", recaps.
+- Drop filler words: "in order to", "please", "note that", "it is important", "basically".
+- Keep articles in a procedure sentence if the meaning is not clear without them.
+- Do not change a rule, a value or a name when you shorten text.
+- Keep: "not", "no", "never", "only". Numbers with units. Rule ids.
+- Payload verbatim: code, commands, paths, flags, error text from a tool, character for
+  character.
+- No fake caveman words. If the short form is not shorter, use the plain form.
+- Full sentences for a security warning, an irreversible action and a confused user.
+- Finding line: pipeline.sh prints one per finding, one per line:
+  `<file>:<line>: <severity> <rule-id> <problem>. <fix>.`
+  Write "src/db.ts:42: high JS1 SQL from string concat. Use a bound parameter."
+  Format applies only to pipeline.sh lines. Raw tool output goes to /artifacts/<tool>.log.
+  If no rule id exists, omit the field.
+- Agent messages (DELIVERY): no greeting, no recap, no "let me". Headings and content only.
+
+EXIT POLICY (shared by pipeline.sh and every host script; host scripts pass it through unchanged)
 0 = clean, 1 = findings, 2 = tool/infra error. Final = highest code seen (2 > 1 > 0).
 - gitleaks: --exit-code 3. 3 → findings, other non-zero → infra.
-- trivy:    --exit-code 3. 3 → findings, other non-zero → infra.
+- trivy:    --exit-code 0. Non-zero → infra. jq on trivy.json decides findings (section 2).
 - semgrep:  --error. 1 → findings, ≥2 → infra.
 - timeout:  124 → infra.
 - Other tools: state their codes in Assumptions, map them the same way.
-- Linters: eslint 1 = findings, 2 = infra. ruff 1 = findings, 2 = infra.
-  golangci-lint 1 = findings, other = infra. swiftlint --strict 2 = findings (violations),
-  1 = infra (verify in Assumptions). swiftformat --lint 1 = findings, other = infra.
-  PMD 4 = findings, 1-2 = infra.
-  jscpd --threshold breach = 1. guardrails.sh follows the same 0/1/2 policy.
+- Linters: EXIT CODES in each PROFILE section. jscpd --threshold breach = 1.
+  guardrails.sh follows the same 0/1/2 policy.
 - A quality gate failure (section 4) is a finding: exit 1.
 - Docs and comment lint (section 4g) is WARNING only. It never changes the exit code.
   Its tool status is `warnings`, not `findings`. Exit 0 with warnings stays exit 0.
   A docs-lint tool crash is still infra: exit 2.
 1) .ai-review/Dockerfile
 - FROM pinned by digest. Distro-correct syntax (addgroup/adduser -S on Alpine).
-- Build args come from versions.lock.json (a `make`-free wrapper script passes
-  them). ARG GITLEAKS_VERSION GITLEAKS_SHA256 TRIVY_VERSION TRIVY_SHA256 MIRROR_URL, and
+- Build args come from versions.lock.json (build.sh passes them). ARG GITLEAKS_VERSION GITLEAKS_SHA256 TRIVY_VERSION TRIVY_SHA256 MIRROR_URL, and
   the same for every other tool in the lock file.
   Empty ARG fails the build: `: "${X:?}"`.
 - Download from MIRROR_URL. `echo "$SHA  file" | sha256sum -c -` in the SAME RUN.
@@ -171,38 +367,90 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
   use the static Linux binaries from the mirror (SHA256). No Xcode or Apple SDK in the image.
   COPY lint/ and quality-gate.json and guardrails.sh → /opt/ai-review/ (read-only, root-owned).
 - jq, git, coreutils `timeout` present. If one is missing, fail the build.
+- OS packages: apt sources point at snapshot.debian.org with the timestamp from the
+  lock file (Alpine: the pinned repository tag). Pinned versions then stay available.
+- Trivy DB: COPY .ai-review/.cache/trivy → /opt/ai-review/trivy-db (read-only, root-owned).
+  Check its SHA256 against the lock file in the same RUN. The DB is part of the image
+  digest. No cache volume can change it.
+- Package data: COPY .ai-review/.cache/data → /opt/ai-review/data (G1 index and top lists).
+- COPY versions.lock.json → /opt/ai-review/versions.lock.json. Runtime checks compare with
+  this copy, never with the repo copy.
+- COPY lint/gitleaks.toml, lint/gitleaksignore, lint/trivy.yaml, lint/trivyignore.
 - User scanner 10001:10001, no login shell. /cache and /artifacts: mode 1777,
   because the runtime UID is the host UID.
 - ENV HOME=/tmp GO111MODULE=on NPM_CONFIG_CACHE=/cache/npm
   NPM_CONFIG_UPDATE_NOTIFIER=false SEMGREP_SEND_METRICS=off
-  GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=*
-  GIT_OPTIONAL_LOCKS=0
+  GIT_CONFIG_COUNT=4
+  GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0=/src
+  GIT_CONFIG_KEY_1=safe.directory GIT_CONFIG_VALUE_1=/tmp/work
+  GIT_CONFIG_KEY_2=core.hooksPath GIT_CONFIG_VALUE_2=/dev/null
+  GIT_CONFIG_KEY_3=core.fsmonitor GIT_CONFIG_VALUE_3=false
+  GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1
+  Do not use safe.directory=*. Git config from the repo .git/config must not run code.
 - No ADD, no secrets in layers, package caches cleaned, package versions pinned.
-- OCI LABELs: source, revision, version, licenses.
+- OCI LABELs: source, revision, version, licenses, and the lock-file SHA256.
 - COPY pipeline.sh, rules/, .semgrepignore, tests/ → /opt/ai-review/.
 - ENTRYPOINT ["/opt/ai-review/pipeline.sh"]. USER 10001:10001 last.
 
 2) .ai-review/pipeline.sh
 - #!/usr/bin/env bash, set -uo pipefail (no -e: every tool must run).
-- Flags: --full-scan (default) | --diff-only [--base-ref REF, default origin/main],
-  mutually exclusive. --fix = semgrep --autofix, needs writable /src.
+- Flags: --stage build|scan (set by ai-review.sh) | --full-scan (default) |
+  --diff-only [--base-ref REF, default origin/main], mutually exclusive.
+  --fix = semgrep --autofix on the scan copy, then `git diff` → /artifacts/fix.patch.
+  --update-baseline (section 4c).
   --lang LIST (comma-separated, e.g. java,js,react,ios,python,go). -h/--help. Unknown flag → exit 2.
-- Pre-flight. Each failure exits 2 with a clear message:
-  /src is a git repo; /artifacts writable; /cache/trivy/db/trivy.db exists;
-  in diff mode `git -C /src rev-parse --verify REF` succeeds
-  (message: "fetch on host first: git fetch origin main").
-- Diff mode:
-  BASE=$(git -C /src merge-base "$REF" HEAD)   # SHA, never the ref name
-  git clone --quiet --no-hardlinks /src /tmp/work ; scan /tmp/work.
+- Pre-flight. Each failure exits 2 with a message in WRITING STYLE:
+    /src is a git repo.
+    /artifacts writable.
+    trivy DB in /opt/ai-review/trivy-db exists.
+    DB SHA256 equals the value in /opt/ai-review/versions.lock.json (copy in the image).
+    DB age ≤ AI_REVIEW_MAX_DB_AGE_DAYS (default 14).
+    Diff mode: `git -C /src rev-parse --verify REF` passes.
+      Message: "fetch on host first: git fetch origin main".
+    Diff mode: `git merge-base` passes.
+      Message: "shallow clone: fetch full history. GitHub fetch-depth: 0. GitLab GIT_DEPTH: 0".
+- Scan copy. Every mode scans a copy in /tmp/work, never /src:
+    Diff mode: BASE=$(git -C /src merge-base "$REF" HEAD)   # SHA, never the ref name
+      git clone --quiet --no-hardlinks /src /tmp/work (committed HEAD only).
+    Full mode: `git -C /src ls-files -co --exclude-standard -z` piped to tar → /tmp/work,
+      plus a clone of .git history for gitleaks. Includes uncommitted files.
+  In the copy, delete only the repo copies of scanner config and ignore files:
+  .semgrepignore, .gitleaks.toml, .gitleaksignore, .trivyignore, trivy.yaml, .eslintrc*,
+  eslint.config.*, .swiftlint.yml, .swiftformat, ruff.toml, .golangci.yml, mypy.ini,
+  .vale.ini, .markdownlint*. Record the names first, for G3. Keep every other file: CI
+  files, .npmrc, tsconfig*.json, CODEOWNERS and build files are scan targets (G1, G3,
+  G13, PROFILE: JS). Then copy /opt/ai-review/.semgrepignore to the copy root.
+  If the copy does not fit in AI_REVIEW_TMP_SIZE → exit 2 "raise AI_REVIEW_TMP_SIZE".
   Pass $BASE to gitleaks (--log-opts "$BASE..HEAD") and semgrep (--baseline-commit $BASE).
-  SCAN_ROOT = /tmp/work in diff mode, /src in full mode.
+  SCAN_ROOT = /tmp/work in all modes.
+- Dependencies for type-aware checks (G2, tsc, mypy, go vet, type-aware ESLint, javac).
+  The copy has no gitignored dirs. CI (or the user) installs dependencies before the scan,
+  with network and scripts off: `npm ci --ignore-scripts` (or `pnpm install
+  --frozen-lockfile --ignore-scripts`), `pip install --require-hashes --no-deps -r <lock>`
+  into .venv, `go mod download`. ai-review.sh mounts each present dir read-only
+  (node_modules, .venv, the Go module cache); pipeline.sh links it into the copy. The
+  checkers read these files. They do not run them.
+  Go env: GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off GONOSUMDB unset.
+  Dependency dir missing → that language's type checks are `not_evaluated` with a
+  warning "install dependencies first", never `passed`.
+- Coverage input: `--coverage PATH` (repeatable). ai-review.sh mounts each file read-only
+  at /coverage/. A coverage file tracked by git is rejected (a commit can fake it).
+- Trusted data files. In diff mode, read allowed-deps.txt, baseline.json and
+  hotspots-reviewed.json from the base commit (`git show "$BASE:.ai-review/<file>"`).
+  In full mode, read them from HEAD. Rules, lint config and quality-gate.json come from
+  the image only.
+- Stage build (section 7, stage 1): run only the build steps of PROFILE: JAVA. No tests.
+  Write reports to /out. Do not run scanners. Do not write summary.json.
+- Stage scan: everything else in this section. Read /out reports as untrusted data.
 
 - detect_project(): run once in SCAN_ROOT, before any tool.
   - Precedence: --lang flag > env AI_REVIEW_LANGS > auto-detection.
     A flag or env value skips detection. Unknown language → exit 2.
   - File list: `git ls-files` (skips ignored files). If not a git repo,
     use `find` with the prune list below.
-  - Language signals (marker file OR ≥1 file with the extension):
+  - Language signals (marker file, OR ≥ 3 files with the extension outside the prune
+    list). 1-2 stray files with no marker → log "minor: <lang> (<n> files)"; scan them
+    with generic.yaml and <lang>.yaml only, no profile tools, no profile findings:
       java:   pom.xml, build.gradle, build.gradle.kts, *.java
       js:     package.json, tsconfig.json, *.ts, *.tsx, *.js, *.jsx, *.mjs, *.cjs
       react:  (implies js) "react" or "react-dom" or "react-native" or "next" in package.json
@@ -233,44 +481,64 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
   - If no language is detected, semgrep runs generic rules and logs
     "no language detected, generic rules only". This is not an error.
 
-- One run_tool() wrapper: `timeout 900`, tee console → /artifacts/<tool>.log,
-  record exit code and duration.
+- One run_tool() wrapper: `timeout "$AI_REVIEW_TOOL_TIMEOUT"`, stdout and stderr →
+  /artifacts/<tool>.log only, record exit code and duration. No raw tool output on the
+  console. On exit 2, print the last 20 lines of the log. A run-level deadline
+  (AI_REVIEW_TIMEOUT) stops new tools after it passes; each skipped tool is `error` (exit 2).
+- Every tool gets its config and ignore file by explicit path from /opt/ai-review. Verify
+  each flag name against the installed version; record it in Assumptions.
   - gitleaks: `git` subcommand on v8.19+, `detect` on older. Always --redact.
-    --report-format sarif --report-path /artifacts/gitleaks.sarif.
-    --baseline-path "$GITLEAKS_BASELINE" if that file exists.
+    --config /opt/ai-review/lint/gitleaks.toml
+    --gitleaks-ignore-path /opt/ai-review/lint/gitleaksignore (empty file)
+    --report-format sarif --report-path /artifacts/gitleaks.sarif --exit-code 3.
+    Legacy secrets: baseline.json (section 4c), not a gitleaks baseline in the repo.
   - trivy: ONE scan: trivy fs --format json --list-all-pkgs -o /artifacts/trivy.json
-    --severity HIGH,CRITICAL --pkg-types os,library --ignore-unfixed
-    --cache-dir /cache/trivy --skip-db-update --skip-java-db-update --offline-scan
-    --skip-dirs .ai-review --exit-code 3.
+    --severity HIGH,CRITICAL --pkg-types library
+    --config /opt/ai-review/lint/trivy.yaml --ignorefile /opt/ai-review/lint/trivyignore
+    --cache-dir /tmp/trivy (copy of /opt/ai-review/trivy-db) --skip-db-update
+    --skip-java-db-update --offline-scan --skip-dirs .ai-review --exit-code 0.
+    Non-zero exit → infra. jq on trivy.json decides: HIGH/CRITICAL with a fixed version =
+    finding (security axis); with no fixed version = warning "unfixed", listed, not gating.
     Then from trivy.json: `trivy convert --format sarif` → trivy.sarif,
     `--format table` → stdout, `--format cyclonedx` → /artifacts/sbom.cdx.json.
-  - semgrep: --metrics=off --disable-version-check
+  - semgrep: --metrics=off --disable-version-check --disable-nosem
     --sarif --output /artifacts/semgrep.sarif --error
-    (configs and targets from detect_project).
+    (configs and targets from detect_project). --disable-nosem makes Semgrep report
+    suppressed results too. pipeline.sh marks a result `suppressed` (SARIF suppressions)
+    only if its nosemgrep comment names the rule id and a reason. G3 counts new ones.
   - Other tools: SARIF if supported, else JSON → /artifacts/<tool>.{sarif,json}.
 - Run quality tools after detect_project(), per detected language, in the same run_tool()
   wrapper. Config comes from /opt/ai-review/lint/. Never read a config from /src
-  (AI-written code must not weaken its own linter). Output is SARIF if supported
-  (eslint --format @microsoft/eslint-formatter-sarif, swiftlint --reporter sarif,
-  PMD -f sarif), else JSON.
-    js:     eslint --no-config-lookup -c lint/eslint.config.mjs --max-warnings 0; tsc --noEmit
-    ios:    swiftlint lint --strict --config lint/.swiftlint.yml;
-            swiftformat --lint --config lint/.swiftformat; plist/entitlements checks (rules)
-    python: ruff check --isolated --config lint/ruff.toml; bandit -r; mypy --strict
-    go:     golangci-lint run -c lint/golangci.yml; go vet
-    java:   pmd check -R lint/pmd-ruleset.xml; checkstyle -c lint/checkstyle.xml; spotbugs
+  (AI-written code must not weaken its own linter). Output is SARIF if supported, else JSON.
+    each:   the commands in TOOLS of the PROFILE section for that language
     all:    jscpd --config lint/jscpd.json (duplication → /artifacts/jscpd.json)
 - Run docs and comment lint (section 4g) after quality tools. Warnings only.
-- Run .ai-review/guardrails.sh after the tools (section 5). Its result is a tool entry.
+- Run /opt/ai-review/guardrails.sh after the tools (section 5). Its result is a tool entry.
+  Do not run a script from the scan copy.
 - Diff mode: lint and guardrails report only findings on lines changed since $BASE
-  (filter by `git diff -U0`). Full mode reports all. State this in --help.
+  (filter by `git diff -U0 -M`, renames followed). Full mode reports all. State this in
+  --help. Limit (state in --help): a change can break an unchanged line (for example, a
+  removed null check). Diff mode misses that finding. The weekly full scan finds it.
+- SARIF size: keep each file below the upload limits recorded in Assumptions (section 9).
+  If a file is over, keep the highest-severity results, set `truncated: true` and the
+  dropped count in summary.json. The full JSON stays in /artifacts.
 - After all tools, evaluate quality-gate.json. Write the gate result into summary.json.
-- /artifacts/summary.json via jq:
-  {scope: {langs, roots, source},
+- /artifacts/summary.json via jq. It validates against
+  .ai-review/schema/summary.schema.json (smoke R6):
+  {schema_version: 1,
+   run: {pipeline_version, image_digest, lock_sha256, base_sha, head_sha, mode,
+         started_at, duration_s},
+   scope: {langs, roots, source, minor_langs},
    tools: [{tool, version, mode, exit_code, status: clean|findings|warnings|error,
-            findings_count, warnings_count, report_path, duration_s}],
+            findings_count, warnings_count, report_path, duration_s, truncated}],
+   axes: {security|reliability|maintainability|tests:
+          {status: passed|failed|not_evaluated, rating, new_findings, baselined,
+           advisory, failed_conditions: [...]}},
    quality: {metrics: {...}, gate: passed|failed, failed_conditions: [...]},
+   suppressions_new: [{file, line, rule_id, reason}],
    docs: {warnings_total, by_rule: {...}, files_affected, blocking: false}}
+  Print one line per axis on the console, then the gate.
+  Then print each new finding as a finding line (WRITING STYLE), max 50. Full list in SARIF.
 - trap EXIT: rm -rf /tmp/work, write summary.json even after abort, print summary table.
 
 3) .ai-review/rules/*.yaml (+ .semgrepignore, tests/)
@@ -278,32 +546,19 @@ EXIT POLICY (shared by both scripts; host script passes it through unchanged)
   Put language-neutral rules in generic.yaml. python.yaml, go.yaml, swift.yaml:
   write new rules for the common CWE classes (injection, deserialization,
   hardcoded credentials, weak crypto, path traversal). Required stack rules:
-  js:   child_process exec with tainted input, eval/new Function, innerHTML /
-        dangerouslySetInnerHTML, prototype pollution (merge/assign of req data), jwt
-        `none`/no verify, NoSQL operator injection, open redirect, SSRF (fetch/axios with
-        user URL), ReDoS-prone regex, express without helmet/CSRF, CORS `*` with credentials.
-  java: SQL/JPQL/HQL string concat, XXE (unsafe DocumentBuilderFactory/SAXParser),
-        ObjectInputStream deserialization, SpEL/OGNL injection, Spring `permitAll` on
-        `/**`, csrf().disable(), actuator exposed, @RequestMapping without method,
-        Runtime.exec with tainted input, weak Random/MD5/SHA1/DES, TrustAllManager,
-        hardcoded password in properties/yaml, path traversal via File(userInput).
-  ios:  ATS off (NSAllowsArbitraryLoads), secrets in UserDefaults/plist, Keychain
-        kSecAttrAccessibleAlways, URLSession trust-all (serverTrust without evaluation),
-        WKWebView JS bridge with remote content, UIWebView, CommonCrypto MD5/SHA1/DES,
-        insecure random (arc4random without secure use for tokens), NSLog/print of
-        sensitive data, http:// URLs, custom URL scheme without validation, pasteboard
-        with secrets, SQLite/CoreData string-built predicates (NSPredicate(format:)).
-        Reference OWASP MASVS in metadata.references.
+  See SEMGREP RULES in each PROFILE section.
 - Every rule has:
-  metadata.cwe: ["CWE-<n>: <name>"], owasp: ["A0<n>:2025 - <name>"] (keep the 2021 tag in owasp_2021 for old rules;
+  metadata.cwe: ["CWE-<n>: <name>"], owasp: ["A<nn>:2025 - <name>"] (two digits, A01 to A10;
+  keep the 2021 tag in owasp_2021 for old rules;
   check each category name against the OWASP site, never from memory),
-  category: security, confidence, likelihood, impact, references.
+  category, axis (from registry.json), confidence, likelihood, impact, references.
 - Source→sink rules use taint mode. Other rules use pattern-either / pattern-inside /
   metavariable-regex. No pattern starts with a bare `...`.
 - Each rule has a fixture in .ai-review/tests/<rule-id>.<ext> with `// ruleid:`
   and `// ok:` cases (Swift uses `// ruleid:` / `// ok:`; plist/XML fixtures use `<!-- ruleid: -->`).
 - .semgrepignore: .ai-review/, node_modules/, build/, target/, dist/, vendor/, .venv/, Pods/,
-  Carthage/, DerivedData/, .build/.
+  Carthage/, DerivedData/, .build/. pipeline.sh copies this file into the scan copy root
+  and replaces any repo copy (section 2). Semgrep never reads the repo's .semgrepignore.
 - Must pass:
   semgrep --validate --config .ai-review/rules
   semgrep --test --config .ai-review/rules .ai-review/tests
@@ -313,16 +568,17 @@ Principle: strictest config is the default. Every disabled rule needs a one-line
 reason in the config file. Do not turn off a rule to make existing code pass.
 
 4a. Sonar-equivalent rules (implement via the named linter or a Semgrep rule in
-    quality.yaml; map each to a Sonar key in metadata.sonar_key)
+    quality.yaml; map each to a Sonar key in metadata.sonar_key; each heading is the axis)
   Reliability:
     S1181 catch Throwable/Exception generically; S108/S2486 empty catch/block;
-    S2259 null dereference; S1854 dead store; S1481 unused variable; S1172 unused param;
-    S3776 cognitive complexity; S1066 collapsible if; S2589 always-true condition;
-    S4144 identical function bodies; S1186 empty function; S2201 ignored return value;
+    S2259 null dereference; S1854 dead store; S2589 always-true condition;
+    S1186 empty function; S2201 ignored return value;
     unhandled promise / floating promise; missing await; mutable default argument (py); unchecked error return (go: errcheck);
     force unwrap / `try!` / `as!` (swift); retain cycle without [weak self];
-    resource not closed (S2095).
+    resource not closed (S2095); remote call without timeout; unbounded retry.
   Maintainability (SOLID/DRY):
+    S3776 cognitive complexity; S1066 collapsible if; S4144 identical function bodies;
+    S1481 unused variable; S1172 unused param;
     S138 function length; S107 parameter count; S1192 duplicated string literal;
     S1448 class too many methods; S1820 too many fields; S104 file length;
     S134 nesting depth; S1200 class coupling; S3358 nested ternary; S125 commented-out code;
@@ -341,44 +597,47 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     weak cipher; S2245 insecure random; S5332 cleartext protocol; S4423 weak TLS;
     S3649/S2077 SQL built from strings; S5144 SSRF; S2083 path traversal; S5334 eval;
     S4829 logging sensitive data; S5122 permissive CORS; S4507 debug on in production.
+  Tests: S2699 test with no assertion; S1607 skipped test; S2925 Thread.sleep in tests;
+    coverage and branch coverage on new code (4c); G4, G5.
 
 4b. Lint config rules
-  - js: strict TypeScript. no-explicit-any, no-non-null-assertion, no-floating-promises,
-    no-misused-promises, switch-exhaustiveness-check, eqeqeq, no-eval, no-implied-eval,
-    no-var, prefer-const, complexity ≤ 10, max-depth ≤ 4, max-lines-per-function ≤ 50,
-    max-params ≤ 4, max-lines ≤ 300, import/no-cycle, import/no-default-export,
-    sonarjs/recommended (all), security/recommended-legacy (all).
-  - python: ruff select = E,F,W,I,B,C90,S,SIM,UP,PL,RUF,ARG,ERA,T20,PTH,TRY,PERF,
-    mccabe ≤ 10, max-args 5, max-branches 12, max-statements 50. mypy --strict.
-    Bandit B1xx–B7xx all on.
-  - go: golangci-lint enable errcheck, govet, staticcheck, gosec, revive, gocyclo ≤ 10,
-    gocognit ≤ 15, dupl, funlen, nestif, ineffassign, unused, gofumpt, bodyclose, noctx.
-  - ios: SwiftLint --strict. opt_in_rules: force_unwrapping, force_cast, force_try,
-    implicitly_unwrapped_optional, unused_import, unused_declaration (needs index; off,
-    say so), weak_delegate, no_print (custom regex for print/NSLog/debugPrint),
-    cyclomatic_complexity warn 10 / error 15, function_body_length 50, type_body_length
-    250, file_length 300, function_parameter_count 4, nesting 3, large_tuple 2,
-    identifier_name, discouraged_optional_collection, empty_count, fatal_error_message,
-    todo, custom rules for hardcoded http:// and secrets. SwiftFormat --lint with
-    a fixed ruleset. Use Swift 6 strict concurrency conventions (Sendable, @MainActor).
-  - java: PMD categories bestpractices, design, errorprone, security, performance,
-    codestyle (minus rules that conflict with Checkstyle). Checkstyle: sun-checks
-    minus the Javadoc and final-parameter rules. SpotBugs effort max, threshold low,
-    plugin find-sec-bugs.
+  - Per stack: see LINT CONFIG in each PROFILE section. Use the 4c thresholds.
   - Inline suppressions (`eslint-disable`, `# noqa`, `# type: ignore`, `//nolint`, `@ts-ignore`, `@ts-nocheck`,
     `swiftlint:disable`, `@SuppressWarnings`, `// NOSONAR`, `nosemgrep`) are findings unless they
     carry a rule id AND a reason (see guardrail G3).
 
-4c. quality-gate.json defaults (override only by editing this file)
-  {"new_code": {"coverage_min": 80, "duplication_max_pct": 3,
-                "max_cognitive_complexity": 15, "max_function_lines": 50,
-                "max_file_lines": 300, "max_params": 4, "max_nesting": 4,
+4c. quality-gate.json defaults (override only by editing this file; G3 protects it)
+  {"schema_version": 1,
+   "new_code": {"coverage_min": 80, "branch_coverage_min": 70, "duplication_max_pct": 3,
+                "max_cognitive_complexity": 15, "max_cyclomatic_complexity": 10,
+                "max_function_lines": 50, "max_file_lines": 300, "max_params": 4,
+                "max_nesting": 4,
                 "new_blocker": 0, "new_critical": 0, "new_major": 0,
                 "new_security_hotspots_unreviewed": 0,
                 "new_vulnerabilities": 0, "new_bugs": 0, "new_code_smells_max": 0},
    "overall": {"duplication_max_pct": 5, "maintainability_rating": "A",
                "reliability_rating": "A", "security_rating": "A",
-               "security_hotspots_unreviewed": 0, "coverage_min": 60}}
+               "security_hotspots_unreviewed": 0, "coverage_min": 60},
+   "coverage": {"required": false},
+   "guardrails": {"max_changed_lines": 400, "max_changed_files": 15,
+                  "new_suppressions_max": 3},
+   "docs": {"blocking": false}}
+  One source of numbers. Each lint config uses these values. Smoke R7 compares them with
+  this map (tool counting differs; the map states the equal value):
+    max_params 4       → eslint max-params 4, ruff max-args 4, PMD ExcessiveParameterList 4,
+                         Checkstyle ParameterNumber 4, SwiftLint function_parameter_count 4.
+    max_nesting 4      → eslint max-depth 4, Checkstyle NestedIfDepth 3 and PMD
+                         AvoidDeeplyNestedIfStmts 3 (both count nested levels after the first).
+    max_cyclomatic 10  → eslint complexity 10, ruff mccabe 10, gocyclo 10, PMD and
+                         Checkstyle CyclomaticComplexity 10, SwiftLint warning 10.
+    max_cognitive 15   → sonarjs cognitive-complexity 15, gocognit 15, PMD CognitiveComplexity 15.
+    max_function_lines 50, max_file_lines 300 → each linter's length rules.
+  Axes. The quality gate is the whole verdict. It has 4 axes. summary.json reports each:
+    security        → new_vulnerabilities, hotspots, security_rating, secrets, CVEs.
+    reliability     → new_bugs, reliability_rating, compile/type errors (G2).
+    maintainability → code smells, complexity, size, duplication, maintainability_rating.
+    tests           → coverage, branch coverage, test integrity (G4, G5).
+  Axis status: passed | failed | not_evaluated. Gate = failed if any axis failed.
   Basis: the SonarQube "Sonar way" gate (new code: no new issues, all new hotspots
   reviewed, coverage ≥ 80%, duplication ≤ 3%) and "Sonar way for AI Code" (adds overall
   code: security rating A, hotspots reviewed, reliability rating). Sonar advises an
@@ -386,17 +645,553 @@ reason in the config file. Do not turn off a rule to make existing code pass.
   does that ("overall.coverage_min"). Ours is stricter than Sonar on reliability (A, not C).
   A hotspot is "reviewed" when .ai-review/hotspots-reviewed.json lists its fingerprint
   with reviewer and date. Gates judge new code first, so legacy debt does not block
-  adoption. A baseline file holds accepted legacy findings (Semgrep --baseline-commit,
-  gitleaks baseline).
+  adoption.
+  Baseline (all tools): .ai-review/baseline.json lists accepted legacy findings with
+  reviewer and date. Key: tool, rule id, file, and partialFingerprints (else a hash of
+  the normalized line). Full mode drops baselined results from the gate and reports
+  them as `baselined` in summary.json. A finding not in the baseline is new.
+  `./ai-review.sh --update-baseline` writes the file from the last full scan. G3 protects it.
+  Use it once at adoption. Do not use it to hide new findings.
   Ratings follow Sonar: A = no issues of that type at Major or above.
-  Coverage comes from a report in /src (lcov, coverage.xml, cover.out, jacoco.xml).
-  If no coverage report exists, the gate fails with "coverage report missing".
+  Coverage comes from a report in /src (lcov, coverage.xml, cover.out, jacoco.xml) that
+  CI writes before the scan. The pipeline does not run tests.
+    Report missing → tests axis `not_evaluated` with a warning, exit unchanged.
+      If coverage.required is true → finding "coverage report missing".
+    Report not for HEAD (commit id in the report or CI metadata differs, or the file is
+      older than the newest commit) → `not_evaluated`, never `passed`.
+  G4 and G5 still evaluate the tests axis without a coverage report.
 
-4d. JAVA PROFILE (applies when java is detected; Maven, Gradle, Spring/Jakarta, Lombok, JPA)
+4d-4f. STACK PROFILES
+  The deep per-stack rules are in section 10, one PROFILE section per stack.
+
+4g. DOCS AND COMMENT LINT (ASD-STE100-based, WARNING ONLY)
+Goal: flag messy docs and comments. Never block. Show the count in the summary.
+- Severity: every docs finding is SARIF level `warning` (or `note`). Never `error`.
+  Exit code stays 0 for warnings. Opt-in blocking: `docs.blocking: true` in
+  quality-gate.json (default false). Only a human sets it.
+- Scope: Markdown/text docs (*.md, *.mdx, *.txt, *.rst, docs/**), and comments in
+  java, js/ts/jsx/tsx, swift, python, go files. Skip generated files, vendor dirs,
+  CHANGELOG, LICENSE, lock files, and files with the header "generated".
+  Diff mode: warn only on changed lines. Full mode: all lines.
+- Tools (offline, config from /opt/ai-review/lint, never from /src):
+    vale --config lint/vale.ini --output=JSON (comment scopes for code files; check
+      which languages the installed Vale supports and list gaps in Assumptions);
+    markdownlint-cli2 --config lint/markdownlint.json;
+    optional lychee --offline for relative links and anchors.
+  Convert JSON to SARIF with jq. Write /artifacts/docs.sarif.
+- STE-lite rules (lint/styles/STE/*.yml). ASD-STE100 is a licensed standard and its full
+  dictionary is not free to copy. These are approximations. Do not claim "STE compliant".
+  Say "STE-lite" in output and Assumptions.
+    S1  sentence > 25 words (descriptive) or > 20 words (line starts with an imperative
+        verb or a list number) → warning.
+    S2  paragraph > 6 sentences → warning.
+    S3  passive voice ("is/are/was/were/been/being + past participle") → warning.
+    S4  weak or banned words: just, simply, easily, obviously, basically, actually,
+        very, really, etc., "and so on", "as needed", "if possible", "should" in a
+        procedure, "may want to", utilize, leverage, "in order to", ASAP → warning.
+    S5  marketing words: powerful, seamless, robust, blazing, cutting-edge, best-in-class.
+    S6  idioms and phrasal-verb pairs with a simple verb (set up → configure/install,
+        carry out → do, find out → learn, take out → remove) → note.
+    S7  vague quantity: "a few", "several", "many", "soon", "quickly", "large" with no
+        number or unit → note.
+    S8  one term, many names: flag mixed terms in one file (issue/finding/alert,
+        lockfile/lock file, repo/repository). Term list in styles/STE/terms.yml → note.
+        terms.yml also holds the 4 axis names (security, reliability, maintainability,
+        tests) and "quality gate" as the name of the whole verdict.
+    S9  condition after command ("Run X if Y") in a numbered step → note.
+    S10 noun cluster > 3 nouns → note (heuristic, may be wrong).
+    S11 warning/caution placed after its step → note.
+    S12 chatter: greeting, "let me", "I hope this helps", "in summary", "as mentioned
+        above", "great question" → warning.
+- Messy-doc rules (markdownlint + custom):
+    D1  heading level skips (h2 → h4), duplicate headings, no top-level heading.
+    D2  code fence with no language; command in prose, not in a code block.
+    D3  line > 120 chars outside code, tables, and URLs; trailing spaces; mixed list markers.
+    D4  broken relative link or missing anchor.
+    D5  README missing: purpose line, setup, run, limits → note.
+    D6  doc mentions a flag, file, or script that does not exist in the repo → warning
+        (grep `--flag`, `path/file.ext` tokens in backticks against the tree).
+    D7  copy-pasted paragraph (jscpd on docs, ≥ 40 tokens) → warning.
+    D8  stale marker: "TODO", "FIXME", "TBD", "coming soon", "WIP" in docs → warning.
+- Comment rules (vale comment scope + Semgrep generic):
+    C1  comment restates the code (`// increment i` above `i++`; same words as the next
+        line, ≥ 80% overlap) → warning.
+    C2  comment > 15 lines in one block, or a function with a comment-to-code ratio > 60% → note.
+    C3  placeholder or noise comments: "fix this", "hack", "magic", "???", "asdf", "foo",
+        "temp", "test123", "stuff", "misc" → warning.
+    C4  commented-out code (≥ 3 lines; same as G7, reported once under G7, not twice).
+    C5  public API (exported function/class, public Java method, public Swift symbol)
+        with no doc comment (Javadoc, TSDoc, DocC, docstring) → note. Skip tests and getters.
+    C6  doc comment out of sync: @param/@return names not in the signature, or `@throws`
+        for an exception not thrown → warning.
+    C7  comment in a language other than the file default (non-ASCII letters in a
+        repo whose comments are all ASCII) → note. Off by default; enable with docs.lang.
+    C8  TODO/FIXME without owner or ticket (`TODO(name)` or `TODO(#123)`) → warning.
+    C9  comment sentence rules S1, S3, S4 apply; skip license headers and annotations.
+- Suppression: `<!-- vale off -->` / `// vale off` allowed. A suppression needs a reason
+  (`vale off: quoted API text`). Without a reason → note, never error.
+- Output: console summary line "docs: N warnings (S:x D:y C:z), non-blocking". Top 10
+  worst files by warnings count in /artifacts/docs.log.
+- Limits (state in Assumptions): heuristics make false positives. Passive-voice and
+  noun-cluster checks are weak. Spelling and grammar are not checked. Docs lint cannot
+  tell if the text is true.
+- Axis: maintainability, warning level. It never changes the axis status.
+- Registry (4h): each rule S1–S12, D1–D8, C1–C3, C5–C9 has one row (C4 uses the G7 row).
+  Axis maintainability, level warning, kind heuristic, fixture in .ai-review/tests/docs/<id>.md (or code file).
+
+4h. RULE REGISTRY (.ai-review/rules/registry.json, one source for all rules)
+One row per rule, guardrail and tool check:
+  {id, axis: security|reliability|maintainability|tests, tool, tool_rule, version_checked,
+   level: gating|advisory|warning, kind: tool|semgrep|heuristic, fixture, sonar_key, cwe, owasp}
+- `level`: gating rules fail the run. Advisory rules are reported in summary.json and
+  never change the exit code. Docs rules are warning.
+- `kind`: tool = a rule in a named tool; semgrep = a rule in rules/*.yaml; heuristic = a
+  pattern check with known false positives. Do not claim a heuristic as full coverage.
+- Architecture and library choices are advisory, not gating. Examples from PROFILE: REACT: "Redux
+  Toolkit only", "forms through react-hook-form + zod", "server state through React
+  Query/SWR", "no prop drilling beyond 3 levels", component file naming. Static analysis
+  cannot prove them. Mark each such rule advisory in the registry.
+- The lint configs, Semgrep files and guardrails.sh read rule lists from the registry or
+  are checked against it (smoke R5). Add a rule = add a row + a fixture in the same change.
+- summary.json groups results by `axis` from this registry.
+
+5) GUARDRAILS FOR AI-GENERATED CODE (.ai-review/guardrails.sh + quality.yaml)
+Plain bash + git + jq. Offline. Each guardrail has an id, a message with file:line,
+and a test in tests/guardrails.sh. Run on the diff (diff mode) or the tree (full mode).
+  G1  Hallucinated dependency: every import/require/package in changed files must be
+      declared in a manifest or lock file in the repo, or be stdlib. Every NEW
+      dependency in a manifest must exist in the lock file with a resolved integrity hash,
+      and must be in the allowlist .ai-review/allowed-deps.txt (if the file exists).
+      Typo-squat check: edit distance ≤ 2 from a popular package name = finding.
+      Why: published research (USENIX Security 2025) found roughly 1 in 5 code samples from
+      16 models named a package that does not exist (about 5% for commercial models). Many
+      invented names repeat across runs, so attackers can register them
+      ("slopsquatting"). Offline controls: (a) a new dependency must be in the allowlist
+      or already resolved in the lock file with an integrity hash; (b) the name must exist in
+      the package index in the image (/opt/ai-review/data/<ecosystem>-index.json, written by
+      resolve.sh: every package in the repo lock files and allowlist, with first-release date,
+      version dates and repository link); (c) release-age cooldown: a version younger than
+      7 days (30 for new packages) = finding; (d) package with < 1 year history or no
+      repository link = finding. A name not in the index (fail closed: offline, the scan
+      cannot ask the registry):
+        PR also adds the name to allowed-deps.txt and CODEOWNERS covers that file → status
+        `review` (exit 0), with "new dependency <name>: age, history and repository not
+        verified offline; reviewer checks them". The next publish job adds it to the index.
+        Else → finding "unknown package <name>: add it to .ai-review/allowed-deps.txt".
+      Typo-squat reference list: /opt/ai-review/data/<ecosystem>-top.txt. resolve.sh builds
+      it from an official public source per ecosystem and records the URL in the lock file.
+      If no official source exists for an ecosystem, the check compares against the
+      index names only and says so in Assumptions; (e) install scripts forbidden: `.npmrc` must have
+      `ignore-scripts=true` and `allow-git=none` (a git dependency can ship its own .npmrc
+      and re-enable scripts); builds use `npm ci --ignore-scripts` (or `pnpm install
+      --frozen-lockfile`), never `npm install`; (f) same rules for Maven (checksum/signature
+      verification on, no unknown repositories), pip (`--require-hashes`) and go (GONOSUMDB
+      unset, go.sum present).
+  G2  Hallucinated API: `tsc --noEmit`, `javac` (via mvn/gradle offline, dependencies
+      pre-seeded in /cache), `mypy`, `go vet` must pass. Type or compile failure = finding. Do not skip it.
+      ios: G2 is NOT RUN in this pipeline (PROFILE: IOS, LIMITS).
+  G3  Suppression abuse and protected files: any new suppression comment without
+      `rule-id: reason` is a finding. A new suppression WITH a reason suppresses that result
+      and is listed in summary.json `suppressions_new` and in the job summary for the reviewer.
+      More than `guardrails.new_suppressions_max` (default 3) new suppressions in one diff =
+      finding. Suppressions include the section 4b list plus `gitleaks:allow`, `trivy:ignore`,
+      `# nosec`, `// vale off`.
+      A change to a protected file, with or without source changes in the same diff:
+        CODEOWNERS on the base branch covers the path → status `review` (warning, exit 0);
+        the platform enforces the human review.
+        No CODEOWNERS entry for the path → finding "protected file needs a CODEOWNERS owner".
+      In diff mode the pipeline uses the base-branch copy of each protected .ai-review file.
+      A PR cannot change the rules that judge it. Protected files: .ai-review/**,
+      ai-review.sh, CI files (.github/workflows/**, .gitlab-ci.yml, Jenkinsfile, and the
+      section 9 list), CODEOWNERS, .npmrc, .yarnrc.yml, pip.conf, settings.xml, tsconfig*.json
+      strict flags, Java build logic (section 7 list), and repo copies of tool config or
+      ignore files (.semgrepignore,
+      .gitleaks.toml, .gitleaksignore, .trivyignore, trivy.yaml, .eslintrc*,
+      eslint.config.*, .swiftlint.yml, ruff.toml, .golangci.yml, mypy.ini, .vale.ini,
+      .markdownlint*). The pipeline never reads the repo copies (section 2).
+  G4  Test integrity: new `.skip`, `xit`, `@Disabled`, `@Ignore`,
+      `t.Skip`, `pytest.mark.skip`, `XCTSkip`, disabled tests in .xctestplan; deleted or
+      weakened assertions (net negative `assert/expect` count in a
+      changed test file); tests with no assertion; mocks of the unit under test.
+  G5  Tests accompany code: a changed source file with logic changes needs a changed or
+      new test file in the same diff. Else finding.
+  G6  Diff size: > 400 changed lines or > 15 files in one change = finding "split the
+      change". Limits are in quality-gate.json under "guardrails".
+  G7  Dead and placeholder code: `TODO`, `FIXME`, `XXX`, `pass`-only bodies,
+      `NotImplementedError`, `fatalError("TODO")`, `throw new Error("not implemented")`,
+      `UnsupportedOperationException`, commented-out code
+      blocks ≥ 3 lines, `console.log`/`print`/`System.out` debug output, unused exports.
+  G8  Unsafe patterns AI often writes: `eval`/`exec`, `shell=True`, `innerHTML`,
+      `verify=False`, `rejectUnauthorized:false`, `chmod 777`, `0.0.0.0/0`, `latest` image
+      tags, `http://` URLs, `Math.random` for tokens, `md5`/`sha1` for security,
+      string-built SQL, catch-and-ignore, `except:` bare, `any` casts.
+  G9  Error handling and logging: every external call (http, db, fs, subprocess) has
+      error handling and a timeout. No secrets, tokens, or PII in log statements.
+  G10 Input validation: every new HTTP handler/route validates its input with a schema
+      library already in the manifest (for example zod, joi, pydantic, bean validation,
+      Codable with validation). Flag handlers that pass request data to a sink without
+      validation (taint rules).
+  G11 Binary and generated files: no new binary, minified, or vendored file; no file
+      > 1 MB; no lock file edit without a manifest edit (and the reverse).
+  G12 Provenance: a commit with a message trailer or file header marking AI authorship is
+      allowed. The guardrails run the same checks. Never relax a rule for AI or
+      human code.
+  G13 CI and build-file hygiene (workflow files in the diff or tree; zizmor offline mode
+      and actionlint when installed, else Semgrep YAML rules):
+      every `uses:` pinned to a 40-char commit SHA (tag only as a comment); top-level
+      `permissions: {}` or read-only with per-job scopes; no `pull_request_target` or
+      `workflow_run` that checks out PR head code; no `${{ github.event.* }}` / branch /
+      title / body interpolated into `run:` (pass through `env:`); no `secrets: inherit`;
+      no `curl | sh`; no self-hosted runner on public PR triggers; `persist-credentials:
+      false` on checkout; no long-lived cloud keys (use OIDC); no artifacts or caches
+      shared across trust boundaries. Same for GitLab CI / Jenkinsfile / Dockerfile
+      (`USER` set, digest-pinned FROM, no `ADD` of URLs, no secrets in ARG/ENV).
+      These map to OpenSSF Scorecard checks: Dangerous-Workflow, Token-Permissions,
+      Pinned-Dependencies, Binary-Artifacts, Code-Review, Branch-Protection.
+  G14 Untrusted-text and agent-config safety (OWASP LLM01/LLM05/LLM06: generated or fetched
+      text is untrusted input; an agent with too much power is a risk). Findings for:
+      hidden or bidi Unicode (U+202A–202E, U+2066–2069, zero-width characters) in source,
+      docs and agent files (AGENTS.md, CLAUDE.md, .cursorrules, .github/copilot-instructions.md,
+      MCP configs); instructions in comments or docs that tell a tool to ignore rules, disable
+      checks, fetch URLs, run commands or exfiltrate data; agent/MCP config granting broad
+      shell, write, or network permissions or `--dangerously-skip-permissions` style flags;
+      model output written straight into a shell, SQL, HTML, or file path without encoding or
+      validation (improper output handling). A change to an agent-config file needs human review (like G3).
+  G15 Exception handling quality (OWASP 2025 "Mishandling of Exceptional Conditions"):
+      catch-and-ignore, catch that returns success, fail-open authorization on error,
+      `finally` that swallows or throws, error messages that leak stack traces or internals,
+      missing timeouts/retries limits/circuit breakers on remote calls, unbounded retry loops,
+      resource not released on error path, generic `throw new Error()` with no cause.
+  Findings are SARIF (ruleId = guardrail id, level = error). Exit by the shared policy.
+  Axis per guardrail (registry.json): security = G1, G3, G8, G10, G11, G13, G14;
+  reliability = G2, G9, G15; maintainability = G6, G7; tests = G4, G5. G12 is a policy
+  statement with no check.
+
+6) CODING CONTRACT (the rules AI code must follow before it is written)
+Emit this block in the quality.yaml header comment AND in the --help output, so a coding
+agent can read it (no separate file):
+  - Smallest change that solves the task. Reuse existing helpers; search before adding.
+  - One responsibility per function/class. ≤ 50 lines, ≤ 4 params, nesting ≤ 4.
+  - Depend on abstractions; inject dependencies; no hidden globals.
+  - No duplicated logic; extract at the third copy. No magic numbers or literal URLs.
+  - Handle every error path. Validate every external input. Parameterize every query.
+  - No new dependency without need; prefer stdlib. Never invent an API: verify it exists.
+  - Never edit lint, CI, or gate config to make code pass. Never skip or weaken a test.
+  - Add or update tests for every behavior change. Keep names clear; no abbreviations.
+  - Write docs and comments in WRITING STYLE. One idea each. Explain why, not what.
+    No filler, no greeting, no recap. Keep code, paths and flags exact.
+    Keep docs true: update them in the same change as the code.
+
+7) ai-review.sh (host bootstrapper)
+- set -euo pipefail. HOME_DIR = the directory of this script (`${BASH_SOURCE[0]}`).
+  Run "$HOME_DIR/.ai-review/doctor.sh --need scan" first. Non-zero → exit 2.
+  Read image.ref and versions.lock.json from HOME_DIR, not from the repo. In CI, HOME_DIR
+  is the base-branch copy (section 9). Locally, HOME_DIR is the repo root.
+- cd "$(git rev-parse --show-toplevel)". mkdir -p .ai-review/.cache .ai-review/artifacts.
+- Image ref, first non-empty wins: AI_REVIEW_IMAGE, .ai-review/image.digest (local build),
+  .ai-review/image.ref (committed, written by the publish job). Empty → exit 2
+  "run .ai-review/resolve.sh and build first". Reject a ref without @sha256:.
+  `docker image inspect "$IMAGE"` fails → exit 2 "load image first".
+- Limits from env (defaults): AI_REVIEW_MEMORY=4g, AI_REVIEW_CPUS=2, AI_REVIEW_TMP_SIZE=2g,
+  AI_REVIEW_TIMEOUT=3600 (whole run, seconds), AI_REVIEW_TOOL_TIMEOUT=900 (per tool).
+  Validate each value with a regex. Bad value → exit 2.
+- /src is always read-only. `--fix` makes pipeline.sh write /artifacts/fix.patch. The host
+  script then runs `git apply --check` and `git apply` on that patch. It does not commit.
+  `--update-baseline` makes pipeline.sh write /artifacts/baseline.json. The host script
+  copies it to .ai-review/baseline.json and prints the diff. It does not commit.
+- `--coverage PATH`: mount each file read-only at /coverage/ (section 2).
+- Two stages, two containers (TRUST MODEL):
+    Stage 1 "build" (only when java is detected): compiles the repo offline (with Error
+      Prone and NullAway where PROFILE: JAVA injects them). It runs no tests. It gets /src:ro,
+      /cache, and an empty `$TMPDIR/ai-review-build` as /out. No /artifacts mount.
+    Stage 2 "scan": all scanners, the gate and the summary. It gets /out:ro as untrusted
+      data: compiled classes and the compiler log. SpotBugs and ArchUnit read the class
+      files as bytecode; they do not run them. pipeline.sh validates the compiler log
+      format and ignores any other file in /out.
+    Limit (state in --help): the repo build controls stage 1. A malicious build can hide
+    its own compile errors or ship classes that differ from the source. G3 protects the
+    build logic (build.gradle*, settings.gradle*, buildSrc/, gradle/, .mvn/, and the
+    <build>, <plugins>, <pluginRepositories>, <repositories>, <profiles> parts of pom.xml).
+    A human then reviews each change to it.
+- Common docker run flags for both stages:
+    docker run --rm --pull=never \
+      --user "$(id -u):$(id -g)" \
+      --memory "$AI_REVIEW_MEMORY" --memory-swap "$AI_REVIEW_MEMORY" \
+      --cpus "$AI_REVIEW_CPUS" --pids-limit 512 \
+      --cap-drop ALL --security-opt no-new-privileges \
+      --read-only --tmpfs "/tmp:rw,nosuid,size=$AI_REVIEW_TMP_SIZE" \
+      --network none \
+      -v "$PWD:/src:ro" \
+      -e AI_REVIEW_LANGS -e AI_REVIEW_TIMEOUT -e AI_REVIEW_TOOL_TIMEOUT \
+      "$IMAGE" --stage build|scan "$@"
+  Stage 2 adds `-v "$PWD/.ai-review/artifacts:/artifacts"`.
+  The cache mount: stage 1 only (/cache for m2, gradle, npm). Stage 2 needs no cache.
+- Capture the exit code: `rc=0; docker run ... || rc=$?`. Stage 1 exits 0 when the build
+  ran (a compile error is data for G2 in stage 2) and 2 on infra error. Final = stage 2 code,
+  or 2 if stage 1 failed. The host script never changes 0/1/2.
+- Exit 137 (out of memory) → exit 2 with "raise AI_REVIEW_MEMORY".
+
+8) .ai-review/tests/smoke.sh
+- Create a temp git repo with: a committed fake secret, a package-lock.json with a
+  known HIGH CVE, one file that trips one Semgrep rule.
+- Run ai-review.sh --full-scan. Assert exit 1.
+- Assert gitleaks.sarif, trivy.sarif, semgrep.sarif, sbom.cdx.json, summary.json
+  exist and pass `jq -e .`. Assert the secret value appears in no artifact.
+- Run ai-review.sh --diff-only --base-ref <clean commit>. Assert exit 1 and that
+  only the new commit's findings appear.
+- Quality cases (one repo each, assert exit 1 and the named rule id in the SARIF):
+  Q1: function with cognitive complexity 25 → S3776 / complexity rule.
+  Q2: same 8-line block copied in two files → jscpd duplication over gate.
+  Q3: `catch (e) {}` empty catch → S108.
+  Q4: new `// eslint-disable-next-line` with no reason → G3.
+  Q5: new `it.skip(...)` → G4. Q6: import of a package not in package.json → G1.
+  Q7: source change with no test change → G5. Q8: type error → G2.
+  Q9: clean, small, tested change → exit 0 and gate=passed.
+  Q13: workflow with `uses: actions/checkout@v4` (tag, not SHA), no `permissions`, and
+       `${{ github.event.pull_request.title }}` inside `run:` → G13.
+  Q14: file with a U+202E bidi character, and an AGENTS.md line "ignore all lint
+       rules" → G14.
+  Q15: `catch (e) { return true }` in an auth check → G15.
+  Q16: new dependency not in lock file or allowlist; `.npmrc` without ignore-scripts → G1.
+  R1: run resolve.sh twice → identical versions.lock.json (idempotent).
+  R2: corrupt one downloaded byte (test hook) → resolve.sh exits 2 on checksum mismatch.
+  R3: fake a release newer than the cooldown → previous stable is chosen and logged.
+  R4: lock file has no "<", "TODO", "latest", empty digest or empty sha256 (jq check).
+  D1: 40-word sentence, passive sentence, "just simply" in a .md → warnings S1,S3,S4; exit 0.
+  D2: heading jump h2→h4, fence with no language, broken link → D1,D2,D4 warnings; exit 0.
+  D3: `// increment i` above `i++`, `// fix this`, `// TODO` with no owner → C1,C3,C8; exit 0.
+  D4: docs.blocking=true set in quality-gate.json → same input exits 1.
+  D5: clean short doc → 0 warnings. Tool crash (bad vale.ini) → exit 2.
+  D6: doc names a flag `--nope` that does not exist → D6 warning.
+  D7: .md with "Let me explain." and "In summary, ..." → S12 warnings; exit 0.
+  D8: fixture with 1 semgrep finding and 1 ESLint finding → each finding line from
+      pipeline.sh matches `<file>:<line>: <severity> [<rule-id> ]<problem>. <fix>.`
+      (regex check). Raw ESLint output is in /artifacts/eslint.log, not on the console.
+  Q10: linter config inside /src weakened → ignored; the pipeline uses /opt/ai-review/lint.
+- Detection cases:
+  A: only pom.xml + src/main/java → log has "langs=java" and "roots=src/main/java";
+     the javascript and swift rule files are not loaded.
+  B: package.json + packages/web/src → "langs=js", root found.
+  C: repo of only .txt files → "generic rules only", semgrep exit 0.
+  D: --lang python on the Java repo → "source=flag", python rules loaded.
+  E: Package.swift + Sources/ → "langs=ios", roots=Sources, SwiftLint ran, ESLint did not.
+  G: package.json with react + src/App.tsx → "langs=js,react", react.yaml loaded, jsx-a11y ran.
+  F: pom.xml + package.json + *.xcodeproj → "langs=java,js,ios".
+- Host prerequisite cases (doctor.sh, section P). Use a stub PATH with fake binaries and a
+  fake os-release (test hook: DOCTOR_ROOT). Do not install real packages:
+  P1: Debian, jq missing, --plan → plan has `apt-get install -y jq`; exit 2; nothing changed.
+  P2: macOS, no brew → plan uses the Homebrew .pkg and no `curl | bash`.
+  P3: all tools present → "ready", exit 0, no prompt. Second run → same output.
+  P4: docker present, `docker info` fails → plan has the daemon start command; exit 2.
+  P5: non-TTY, no --yes, a tool missing → no install command runs; exit 2.
+  P6: `uname -s` = MINGW64_NT → WSL2 steps printed; exit 2.
+  P7: --need scan with gh and cosign missing → exit 0 (scan does not need them).
+  P8: no network, a tool missing → no install; plan names the mirror override; exit 2.
+  P9: --yes with stub manager → each command printed before it runs; second check passes.
+- Tamper cases (TRUST MODEL). Each must still report the seeded finding:
+  H1: PR adds `.semgrepignore` with `*`, `.gitleaksignore`, `.gitleaks.toml` with no rules,
+      `.trivyignore` with the CVE id → all three findings still reported; G3 flags each file.
+  H2: config-only PR (raises a threshold in quality-gate.json, adds a name to
+      allowed-deps.txt, adds a fingerprint to baseline.json):
+      no CODEOWNERS entry → G3 finding, exit 1; CODEOWNERS entry → G3 `review`, exit 0.
+      Both: the scan uses the base-branch copies, so the change has no effect on this PR.
+  H3: trivy DB file with a wrong digest → exit 2. DB older than max age → exit 2.
+  H4: Gradle build script writes a fake clean summary.json and SARIF into /out → ignored;
+      the verdict comes from the scan stage; exit 1. The same PR's build.gradle change → G3.
+  H10: PR changes .ai-review/doctor.sh and ai-review.sh to write a marker → in the CI
+      template flow, the marker file is absent (only base-branch copies ran).
+  H11: tracked lcov.info with 100% → rejected; tests axis `not_evaluated`.
+  H5: new `// nosemgrep: rule-id: reason` → result suppressed, listed in
+      `suppressions_new`, exit 0. Same comment with no reason → G3 finding, exit 1.
+      4 new suppressions with reasons → G3 finding, exit 1.
+  H6: new `gitleaks:allow` comment → G3 finding.
+  H7: coverage report older than HEAD (commit id in the report differs) → coverage
+      `not_evaluated`, never `passed`.
+  H8: repo `.git/config` sets `core.hooksPath` and `core.fsmonitor` to a script that
+      writes a marker → marker file absent after the scan.
+  H9: `--fix` → /src mount stays read-only; ai-review.sh applies /artifacts/fix.patch
+      with `git apply` on the host.
+- Axis cases (one repo each; summary.json `axes.<axis>.status` = failed, others passed):
+  V1 security: SQL built by string concat. V2 reliability: empty catch.
+  V3 maintainability: cognitive complexity 25. V4 tests: new `it.skip` and no test change.
+- Baseline cases:
+  B1: full scan of a repo with 3 legacy findings, all in baseline.json → exit 0.
+  B2: same repo plus 1 new finding → exit 1, only the new finding is reported as new.
+- Registry and schema cases:
+  R5: every registry.json row: tool rule exists in the installed tool version, fixture
+      exists, axis is one of the 4. Every rule enabled in a lint config has a row.
+  R6: versions.lock.json and summary.json validate against their schemas in .ai-review/schema/.
+  R7: per threshold in quality-gate.json and per linter: a fixture at the limit passes,
+      a fixture at limit + 1 fails (for example nesting 4 passes, nesting 5 fails). This
+      proves the section 4c map. It does not trust the map.
+
+9) CI INTEGRATION (the tool wires itself into the CI the repo already uses)
+Contract for every CI: fetch base branch → run ./ai-review.sh → read exit code (0/1/2)
+→ upload SARIF + artifacts. No CI-specific logic lives in pipeline.sh.
+- `./ai-review.sh --init-ci [auto|github|gitlab|generic] [--write]`:
+  - auto: detect from repo files, first match wins, log "ci detected: <name>":
+      .github/workflows/        → github
+      .gitlab-ci.yml            → gitlab
+      Jenkinsfile               → generic (emit a stage snippet)
+      bitbucket-pipelines.yml, azure-pipelines.yml, .circleci/config.yml,
+      .buildkite/              → generic (emit a step snippet)
+      none found                → generic, plus print "no CI found".
+    If no CI file exists, also read the remote URL (`git remote get-url origin`):
+    github.com → github, gitlab → gitlab.
+  - Without --write: print the snippet and the target path (dry run, default).
+  - With --write: create a NEW file only (.github/workflows/ai-review.yml,
+    .gitlab/ai-review.gitlab-ci.yml + one `include:` line printed for the user to add).
+    Never edit or overwrite an existing CI file. Existing target → exit 2 with the path.
+- Auto-offer after setup. The user needs no knowledge of --init-ci:
+    build.sh succeeds → it runs `./ai-review.sh --init-ci auto` (dry run).
+    It shows the CI found, the target path and the snippet.
+    TTY → ask one question: "Add ai-review to <ci> at <path>? [y/N]". Default no.
+      y → run `./ai-review.sh --init-ci auto --write`. Print the new file path and the next
+      git commands (add, commit). Do not commit or push.
+      N → print the two manual commands (--init-ci, --init-ci --write) and stop.
+    Non-TTY, no --write-ci → do not write. Print the snippet and the two manual commands.
+    build.sh --write-ci → write with no prompt (for agents and CI bootstrap).
+    Target file exists → do not ask. Print "ai-review already in CI: <path>".
+    Record the answer in .ai-review/.cache/ci-offer.json. Do not ask again after a "N".
+    The manual commands always work, also after a "N".
+- Templates in .ai-review/ci/ must follow guardrail G13: actions pinned by full SHA
+  (resolved by resolve.sh from the action's latest release tag, tag kept as a comment),
+  `permissions: {}` then per-job minimum, no `pull_request_target`, no untrusted
+  `${{ }}` in `run:`, `persist-credentials: false`, `fetch-depth: 0`.
+- Trusted inputs in the scan job (TRUST MODEL). On a PR, the job extracts these files from
+  the base branch into "$RUNNER_TEMP/trusted/" with the same layout, not from the PR checkout:
+    ai-review.sh, .ai-review/doctor.sh, .ai-review/image.ref, .ai-review/versions.lock.json
+    (`git show "origin/$BASE_REF:<path>" > "$RUNNER_TEMP/trusted/<path>"`).
+  Then it runs "$RUNNER_TEMP/trusted/ai-review.sh" from the repo root. No script from the
+  PR checkout runs before or during the scan. cosign verify uses the identity in the
+  trusted lock file. Rules, lint config and the gate live in the image.
+- Before the scan, the job installs dependencies with scripts off (section 2) and runs the
+  repo tests that write coverage. These steps run PR code. They run before the scan, with
+  no secrets and read-only permissions, and they cannot change the trusted files.
+  Pass each coverage file with --coverage.
+- Each scan job runs `.ai-review/doctor.sh --need ci --plan` (base-branch copy) first. Missing
+  tool → fail fast. Do not install tools in a scan job. Prepare the runner image instead.
+- Each template must do, per provider:
+  github:  trigger pull_request + push to default branch; `git fetch origin $BASE_REF`;
+           run diff mode on PRs, full scan on push to default and on a weekly schedule;
+           pull the image by digest and run `cosign verify` with the identity in the lock
+           file before the scan; upload each *.sarif with github/codeql-action/upload-sarif
+           (category = tool name), needs security-events: write; upload artifacts; job
+           summary from summary.json (one line per axis).
+           Fork PRs: no secrets, no `security-events: write`. Skip upload-sarif when
+           `github.event.pull_request.head.repo.full_name != github.repository`. Keep the
+           artifacts upload and the exit code. Never use pull_request_target.
+           Code scanning on private repos needs GitHub Advanced Security. Without it, skip
+           upload-sarif, keep artifacts, and print "code scanning not enabled".
+           SARIF upload limits (file size, results per run, runs per file): read them from
+           the GitHub docs at generation time. Record them in Assumptions. pipeline.sh splits
+           or caps each file below them and sets `truncated: true` in summary.json.
+  gitlab:  merge_request_event + default branch; `GIT_DEPTH: 0` (the default clone is
+           shallow and merge-base fails); `git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME`;
+           artifacts: paths .ai-review/artifacts/, `reports: sast` for semgrep SARIF→ gl-sast
+           conversion only if a verified converter exists (else keep SARIF as plain artifacts
+           and say so); allow_failure false. Do not share a cache between MR jobs and
+           default-branch jobs (cache key includes `$CI_COMMIT_REF_SLUG`).
+  generic: a POSIX sh script that does fetch, run, archive, and maps exit 1 and 2 to a failed
+           build. Include copy-paste snippets for Jenkins, Bitbucket, Azure, CircleCI as
+           comments, each marked UNTESTED unless smoke-tested.
+- Cache scope: a cache written by a PR job is never restored in a default-branch job.
+  The trivy DB is in the image (section 1), not in a cache.
+- Publish job (.ai-review/ci/publish.yml for GitHub; a scheduled job in gitlab.yml).
+  Weekly and on a change to versions.lock.json on the default branch:
+    1. Run resolve.sh (network). Refresh the trivy DB.
+    2. Run build.sh: build with --provenance=true --sbom=true, push to the registry by digest.
+    3. Sign keyless with cosign (CI OIDC identity). Attest provenance
+       (`actions/attest-build-provenance` on GitHub).
+    4. Open a PR that updates versions.lock.json and .ai-review/image.ref. Do not push to
+       the default branch. A human merges it. Open it with a GitHub App token
+       (actions/create-github-app-token). A PR opened with GITHUB_TOKEN starts no
+       workflow, so the required ai-review check never runs on it. Verify this rule in the
+       GitHub docs and record it in Assumptions. No App configured → print the limit.
+  Permissions: `contents: write`, `pull-requests: write`, `packages: write`, `id-token: write`,
+  `attestations: write`, in this job only. The scan job keeps read-only permissions.
+  This job is the only path to SLSA Build L2. A local build.sh run is L1 at most.
+- --init-ci prints runner requirements: the output of `.ai-review/doctor.sh --need ci --plan`,
+  the image ref (AI_REVIEW_IMAGE, else image.digest, else image.ref) and the lock file.
+- Image delivery in CI: pull by digest from the registry, or `docker load` an artifact.
+  Do not build the image inside the scan job.
+- Branch protection: print (do not apply) these settings:
+    the ai-review check is required; 1 approving review; dismiss stale approvals;
+    "Require review from Code Owners" on (G3 `review` status is safe only with it; the
+    scan cannot verify this setting);
+    CODEOWNERS lines that need a human owner for `.github/workflows/**`, `.gitlab-ci.yml`,
+    `.ai-review/**`, `ai-review.sh`, `.npmrc`, CODEOWNERS.
+  Limit (state in --help and README): on GitHub `pull_request`, the workflow file comes from
+  the PR. A PR can edit the workflow and skip the scan. Two controls stop that together:
+  CODEOWNERS review on the paths above, and an org ruleset that requires the workflow
+  (GitHub) or a pipeline execution policy (GitLab). The tool prints them. It cannot apply them.
+- Smoke tests: I1 repo with .github/workflows → "ci detected: github" and a dry-run
+  snippet with SHA-pinned actions only (grep: no `@v`, no `@main`). I2 .gitlab-ci.yml → gitlab.
+  I3 no CI file → generic. I4 --write on an existing target → exit 2, file unchanged.
+  I5 --write on a clean repo creates exactly one new file.
+  I6 build.sh success, TTY stub answers "y" → exactly one new CI file; no commit made.
+  I7 TTY stub answers "N" → no file; manual commands printed; next build.sh does not ask.
+  I8 non-TTY → no file; snippet and manual commands printed; exit code unchanged.
+  I9 github template: upload-sarif has the fork condition; the scan job extracts
+     ai-review.sh, doctor.sh, image.ref and versions.lock.json with `git show origin/...`
+     and runs only the trusted copies; no `--yes` in any scan job.
+  I10 gitlab template has `GIT_DEPTH: 0` and a ref-scoped cache key.
+  I11 publish template: write permissions only in the publish job; it opens a PR, no push.
+
+10) STACK PROFILES (one PROFILE section per stack; common pattern in PROFILES)
+
+PROFILE: JAVA
+SCOPE
+Covers: Java 17+, Maven, Gradle, Spring/Jakarta, Lombok, JPA.
+On when: detect_project() finds java (pom.xml, build.gradle, build.gradle.kts, or ≥ 3 *.java files).
+
+OUTPUT FILES (added to the OUTPUT TREE)
+.ai-review/lint/pmd-ruleset.xml
+.ai-review/lint/checkstyle.xml
+.ai-review/lint/java-init.gradle     (Gradle init script, PROFILE RULES)
+.ai-review/lint/archunit/            (default ArchUnit rule set)
+.ai-review/rules/java.yaml
+.ai-review/tests/<rule-id>.java      (one fixture per rule)
+
+TOOLS (resolve each with rule R; Maven Central)
+PMD, Checkstyle, SpotBugs + find-sec-bugs + fb-contrib, Error Prone + NullAway, ArchUnit,
+Spotless. JDK pinned in the lock file.
+Stage 1 (build, section 7): the offline build in PROFILE RULES.
+Stage 2 (scan), each in run_tool():
+  pmd check -R lint/pmd-ruleset.xml -f sarif
+  checkstyle -c lint/checkstyle.xml
+  spotbugs on the class files in /out (bytecode only)
+  ArchUnit rule set on the class files in /out (bytecode only)
+
+EXIT CODES
+PMD 4 = findings, 1-2 = infra. Checkstyle, SpotBugs, ArchUnit runner: state the codes
+in Assumptions and map them to 0/1/2.
+
+LINT CONFIG
+- PMD categories bestpractices, design, errorprone, security, performance,
+    codestyle (minus rules that conflict with Checkstyle). Checkstyle: sun-checks
+    minus the Javadoc and final-parameter rules. SpotBugs effort max, threshold low,
+    plugin find-sec-bugs.
+
+SEMGREP RULES (rules/java.yaml)
+- SQL/JPQL/HQL string concat, XXE (unsafe DocumentBuilderFactory/SAXParser),
+  ObjectInputStream deserialization, SpEL/OGNL injection, Spring `permitAll` on
+  `/**`, csrf().disable(), actuator exposed, @RequestMapping without method,
+  Runtime.exec with tainted input, weak Random/MD5/SHA1/DES, TrustAllManager,
+  hardcoded password in properties/yaml, path traversal via File(userInput).
+
+PROFILE RULES
   Build detection: pom.xml → Maven (`mvn -o -B -q`). build.gradle(.kts) → Gradle
     (`gradle --offline --no-daemon`). Do NOT run wrapper scripts (they download).
     Pre-seed dependencies and plugins in /cache/m2 or /cache/gradle. If missing,
-    exit 2 "seed the Java cache on host". Multi-module: iterate modules, report per module.
+    exit 2 "seed the Java cache: .ai-review/resolve.sh --seed-java". Multi-module: iterate
+    modules, report per module.
+    Seeding: `resolve.sh --seed-java` (host, network) runs `mvn -B dependency:go-offline`
+    or `gradle --no-daemon dependencies` into .ai-review/.cache/m2 or gradle. This runs the
+    repo build with network. Run it only on a trusted ref. In CI, a seed job on the
+    base branch fills the cache. A PR that adds a Java dependency fails stage 1 with exit 2
+    "reseed"; the dependency then needs a seed run from a trusted ref. State this limit.
+    All Java build steps run in stage 1 (section 7). Stage 2 reads only their reports.
     Read JDK version from maven.compiler.release / toolchain / sourceCompatibility.
     Unsupported or EOL JDK (< 17) = finding.
   Compile gate: `javac -Xlint:all -Werror` equivalent through the build (`-parameters`,
@@ -449,6 +1244,12 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     OBJECT_DESERIALIZATION, HARD_CODE_PASSWORD, WEAK_MESSAGE_DIGEST_MD5, PREDICTABLE_RANDOM,
     CIPHER_INTEGRITY, ECB_MODE, SPRING_CSRF_PROTECTION_DISABLED, SPRING_ENDPOINT,
     CRLF_INJECTION_LOGS, LDAP_INJECTION, TRUST_BOUNDARY_VIOLATION, URLCONNECTION_SSRF_FD.
+  Injection into the user build in stage 1 (Error Prone, NullAway, Spotless check).
+    JaCoCo data comes from CI tests through --coverage. ArchUnit runs in stage 2:
+    Gradle: an init script `--init-script /opt/ai-review/lint/java-init.gradle` adds them.
+    Maven: use them only if the pom already configures them. Else report
+      "<tool>: not configured" as an advisory result. Do not edit the pom.
+    Prove each path with a fixture repo (one Maven, one Gradle). Untested path = NOT RUN.
   Compile-time null and bug checks: Error Prone (2.14 or newer) with NullAway as compiler
     plugin on every build. NullAway `check("NullAway", ERROR)` (default is warn).
     Use OnlyNullMarked / @NullMarked (JSpecify) for packages. Exclude generated code with
@@ -461,14 +1262,15 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     Formatting: Spotless (google-java-format) check mode only. A format diff = finding.
     Dependency scan offline: Trivy (java-db). OWASP Dependency-Check offline mode is NOT
     verified here. Do not add it unless resolve.sh can fetch and verify its data feed.
-  Architecture tests (SOLID/DIP enforced, ArchUnit, run in test phase offline):
+  Architecture tests (SOLID/DIP enforced, ArchUnit; stage 2 imports the compiled classes
+    from /out as bytecode with ArchUnit's class importer; no test runner, no repo code runs):
     no cycles between packages; domain/ does not import infrastructure/, web/, jakarta.persistence
     in pure domain; controllers do not call repositories directly; no @Service in web
     packages; no field injection (@Autowired on fields), constructor injection only;
     no `java.util.Date`/`Calendar` (use java.time); no `System.out`; no `printStackTrace`;
     exceptions from `..api..` are checked/typed per project convention; layered architecture
     controller → service → repository only. Pipeline ships a default ArchUnit rule
-    set in /opt/ai-review/lint/archunit/. It runs the set against compiled classes.
+    set in /opt/ai-review/lint/archunit/. It checks the set against compiled classes.
   Spring/Jakarta Semgrep rules (rules/java.yaml): @RequestBody without @Valid,
     @PathVariable/@RequestParam used in a query without binding, @CrossOrigin("*"),
     @Transactional on private/self-invoked methods, @Async/@Scheduled without error
@@ -494,7 +1296,60 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     plugins with `<version>` missing, `<scope>system</scope>`. Require Maven Enforcer rules
     (dependencyConvergence, banDuplicatePomDependencyVersions, requireJavaVersion) in the pom.
 
-4e. JAVASCRIPT / TYPESCRIPT PROFILE (applies when js is detected; Node, browser, React, Next, Express, NestJS)
+SMOKE CASES
+  A (detection case, section 8) must pass.
+  J1 security: JPQL built by string concat → finding. J2 reliability: empty catch on
+  IOException → S108. J3 maintainability: method with 6 params → ParameterNumber.
+  J4 tests: new @Disabled without ticket id → G4.
+  J5: Gradle fixture repo → Error Prone ran through java-init.gradle.
+  J6: Maven fixture repo with no Error Prone in the pom → "errorprone: not configured"
+      advisory, exit unchanged.
+
+LIMITS
+- A malicious build can fake its own compile result (section 7). G3 protects
+  build logic.
+- A PR that adds a Java dependency needs `resolve.sh --seed-java` from a trusted ref.
+- Maven: Error Prone, NullAway and Spotless run only if the pom configures them.
+- Kotlin and Android are not covered.
+
+PROFILE: JS
+SCOPE
+Covers: JavaScript, TypeScript, Node, browser, Express, Fastify, NestJS, Koa, Hono.
+On when: detect_project() finds js (package.json, tsconfig.json, or ≥ 3 *.ts/*.tsx/*.js/*.jsx/*.mjs/*.cjs files).
+
+OUTPUT FILES (added to the OUTPUT TREE)
+.ai-review/lint/eslint.config.mjs
+.ai-review/lint/tsconfig.base.json
+.ai-review/lint/depcruise.cjs
+.ai-review/rules/javascript.yaml     (JS and TS)
+.ai-review/tests/<rule-id>.{js,ts}   (one fixture per rule)
+
+TOOLS (resolve each with rule R; npm, lock file with integrity hashes)
+eslint + plugins (list in PROFILE RULES), typescript-eslint, typescript, dependency-cruiser.
+Each in run_tool():
+  eslint --no-config-lookup -c lint/eslint.config.mjs --max-warnings 0
+         --format @microsoft/eslint-formatter-sarif
+  tsc --noEmit -p <tsconfig> (per tsconfig found)
+  depcruise --config lint/depcruise.cjs
+
+EXIT CODES
+eslint 1 = findings, 2 = infra. tsc 1-2 with diagnostics = findings (G2), other = infra.
+depcruise: state the codes in Assumptions.
+
+LINT CONFIG
+- strict TypeScript. no-explicit-any, no-non-null-assertion, no-floating-promises,
+    no-misused-promises, switch-exhaustiveness-check, eqeqeq, no-eval, no-implied-eval,
+    no-var, prefer-const, complexity ≤ 10, max-depth ≤ 4, max-lines-per-function ≤ 50,
+    max-params ≤ 4, max-lines ≤ 300, import/no-cycle, import/no-default-export,
+    sonarjs/recommended (all), security/recommended-legacy (all).
+
+SEMGREP RULES (rules/javascript.yaml)
+- child_process exec with tainted input, eval/new Function, innerHTML /
+  dangerouslySetInnerHTML, prototype pollution (merge/assign of req data), jwt
+  `none`/no verify, NoSQL operator injection, open redirect, SSRF (fetch/axios with
+  user URL), ReDoS-prone regex, express without helmet/CSRF, CORS `*` with credentials.
+
+PROFILE RULES
   Detection: package.json "type", "engines", "workspaces". Lockfile (package-lock.json,
     pnpm-lock.yaml, yarn.lock) is REQUIRED. No lockfile = finding. Trivy cannot run
     properly without it. Framework hints: react, next, vue, @angular/core, svelte, express, fastify,
@@ -577,7 +1432,7 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     ban-ts-comment (no @ts-ignore / @ts-nocheck; @ts-expect-error needs ≥ 10-char reason),
     no-unsafe-type-assertion, no-unused-vars (args after-used, caughtErrors all),
     method-signature-style, naming-convention (types PascalCase, vars camelCase, consts UPPER_CASE).
-  React rules (when react present): eslint-plugin-react (jsx-key, no-danger,
+  React rules (when react present; details in PROFILE: REACT): eslint-plugin-react (jsx-key, no-danger,
     no-danger-with-children, jsx-no-target-blank, jsx-no-script-url, no-unstable-nested-components,
     no-array-index-key, no-unsafe, jsx-no-constructed-context-values, no-this-in-sfc,
     jsx-no-useless-fragment, self-closing-comp, void-dom-elements-no-children, function-component-definition),
@@ -633,10 +1488,45 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     (`packages/*/src/*`); no test files imported from source; no `devDependencies` imported from
     source; report orphan modules. Fail on violations of severity "error".
 
-4f. REACT PROFILE (applies when react is detected; React 18/19, Next.js, Vite, React Native, Redux/Zustand/React Query)
+SMOKE CASES
+  B (detection case, section 8) and Q1-Q9, Q13-Q16 (they use JS fixtures) must pass.
+  JS1 security: req.query into child_process.exec → finding.
+  JS2 reliability: floating promise → no-floating-promises.
+  JS3 maintainability: function with 60 lines → max-lines-per-function.
+  JS4 tests: new `it.only` → G4.
+
+LIMITS
+- Type checks need node_modules installed with scripts off (section 2).
+- Bundle and perf rules report metrics only.
+- Vue, Angular and Svelte get the generic JS rules only.
+
+PROFILE: REACT
+SCOPE
+Covers: React 18/19, Next.js, Vite, React Native, Redux/Zustand/React Query.
+On when: js is on, and "react", "react-dom", "react-native" or "next" is in package.json, or any *.tsx / *.jsx file exists. Loaded on top of PROFILE: JS.
+
+OUTPUT FILES (added to the OUTPUT TREE)
+.ai-review/rules/react.yaml          (loaded on top of javascript.yaml)
+.ai-review/tests/<rule-id>.{jsx,tsx} (one fixture per rule)
+The ESLint React block lives in lint/eslint.config.mjs (PROFILE: JS).
+
+TOOLS
+The PROFILE: JS tools, plus the plugins in PROFILE RULES (Tooling).
+
+EXIT CODES
+Same as PROFILE: JS.
+
+LINT CONFIG
+The react block of lint/eslint.config.mjs. Rules in PROFILE RULES.
+
+SEMGREP RULES (rules/react.yaml)
+The Security list in PROFILE RULES, in taint mode.
+
+PROFILE RULES
   Detection: read the react version from the lock file. React < 18 or an EOL major
     = finding. Frameworks: next, vite, react-scripts (CRA is deprecated = finding), remix,
     gatsby, react-native/expo. Each framework turns on its rule group below.
+  Library and architecture choices in this profile are advisory (section 4h), not gating.
   Tooling (all from /opt/ai-review, configs in lint/eslint.config.mjs, react block):
     eslint-plugin-react (flat/recommended + jsx-runtime), eslint-plugin-react-hooks,
     eslint-plugin-jsx-a11y (strict), eslint-plugin-react-refresh (only-export-components),
@@ -731,288 +1621,164 @@ reason in the config file. Do not turn off a rule to make existing code pass.
     `.env*` files with secrets = findings; do not run bundle report via `vite build --mode`
     (needs a build); size check only on committed budget file if present.
 
-4g. DOCS AND COMMENT LINT (ASD-STE100-based, WARNING ONLY)
-Goal: flag messy docs and comments. Never block. Show the count in the summary.
-- Severity: every docs finding is SARIF level `warning` (or `note`). Never `error`.
-  Exit code stays 0 for warnings. Opt-in blocking: `docs.blocking: true` in
-  quality-gate.json (default false). Only a human sets it.
-- Scope: Markdown/text docs (*.md, *.mdx, *.txt, *.rst, docs/**), and comments in
-  java, js/ts/jsx/tsx, swift, python, go files. Skip generated files, vendor dirs,
-  CHANGELOG, LICENSE, lock files, and files with the header "generated".
-  Diff mode: warn only on changed lines. Full mode: all lines.
-- Tools (offline, config from /opt/ai-review/lint, never from /src):
-    vale --config lint/vale.ini --output=JSON (comment scopes for code files; check
-      which languages the installed Vale supports and list gaps in Assumptions);
-    markdownlint-cli2 --config lint/markdownlint.json;
-    optional lychee --offline for relative links and anchors.
-  Convert JSON to SARIF with jq. Write /artifacts/docs.sarif.
-- STE-lite rules (lint/styles/STE/*.yml). ASD-STE100 is a licensed standard and its full
-  dictionary is not free to copy. These are approximations. Do not claim "STE compliant".
-  Say "STE-lite" in output and Assumptions.
-    S1  sentence > 25 words (descriptive) or > 20 words (line starts with an imperative
-        verb or a list number) → warning.
-    S2  paragraph > 6 sentences → warning.
-    S3  passive voice ("is/are/was/were/been/being + past participle") → warning.
-    S4  weak or banned words: just, simply, easily, obviously, basically, actually,
-        very, really, etc., "and so on", "as needed", "if possible", "should" in a
-        procedure, "may want to", utilize, leverage, "in order to", ASAP → warning.
-    S5  marketing words: powerful, seamless, robust, blazing, cutting-edge, best-in-class.
-    S6  idioms and phrasal-verb pairs with a simple verb (set up → configure/install,
-        carry out → do, find out → learn, take out → remove) → note.
-    S7  vague quantity: "a few", "several", "many", "soon", "quickly", "large" with no
-        number or unit → note.
-    S8  one term, many names: flag mixed terms in one file (issue/finding/alert,
-        lockfile/lock file, repo/repository). Term list in styles/STE/terms.yml → note.
-    S9  condition after command ("Run X if Y") in a numbered step → note.
-    S10 noun cluster > 3 nouns → note (heuristic, may be wrong).
-    S11 warning/caution placed after its step → note.
-- Messy-doc rules (markdownlint + custom):
-    D1  heading level skips (h2 → h4), duplicate headings, no top-level heading.
-    D2  code fence with no language; command in prose, not in a code block.
-    D3  line > 120 chars outside code, tables, and URLs; trailing spaces; mixed list markers.
-    D4  broken relative link or missing anchor.
-    D5  README missing: purpose line, setup, run, limits → note.
-    D6  doc mentions a flag, file, or script that does not exist in the repo → warning
-        (grep `--flag`, `path/file.ext` tokens in backticks against the tree).
-    D7  copy-pasted paragraph (jscpd on docs, ≥ 40 tokens) → warning.
-    D8  stale marker: "TODO", "FIXME", "TBD", "coming soon", "WIP" in docs → warning.
-- Comment rules (vale comment scope + Semgrep generic):
-    C1  comment restates the code (`// increment i` above `i++`; same words as the next
-        line, ≥ 80% overlap) → warning.
-    C2  comment > 15 lines in one block, or a function with a comment-to-code ratio > 60% → note.
-    C3  placeholder or noise comments: "fix this", "hack", "magic", "???", "asdf", "foo",
-        "temp", "test123", "stuff", "misc" → warning.
-    C4  commented-out code (≥ 3 lines; same as G7, reported once under G7, not twice).
-    C5  public API (exported function/class, public Java method, public Swift symbol)
-        with no doc comment (Javadoc, TSDoc, DocC, docstring) → note. Skip tests and getters.
-    C6  doc comment out of sync: @param/@return names not in the signature, or `@throws`
-        for an exception not thrown → warning.
-    C7  comment in a language other than the file default (non-ASCII letters in a
-        repo whose comments are all ASCII) → note. Off by default; enable with docs.lang.
-    C8  TODO/FIXME without owner or ticket (`TODO(name)` or `TODO(#123)`) → warning.
-    C9  comment sentence rules S1, S3, S4 apply; skip license headers and annotations.
-- Suppression: `<!-- vale off -->` / `// vale off` allowed. A suppression needs a reason
-  (`vale off: quoted API text`). Without a reason → note, never error.
-- Output: console summary line "docs: N warnings (S:x D:y C:z), non-blocking". Top 10
-  worst files by warnings count in /artifacts/docs.log.
-- Limits (state in Assumptions): heuristics make false positives. Passive-voice and
-  noun-cluster checks are weak. Spelling and grammar are not checked. Docs lint cannot
-  tell if the text is true.
-
-5) GUARDRAILS FOR AI-GENERATED CODE (.ai-review/guardrails.sh + quality.yaml)
-Plain bash + git + jq. Offline. Each guardrail has an id, a message with file:line,
-and a test in tests/guardrails.sh. Run on the diff (diff mode) or the tree (full mode).
-  G1  Hallucinated dependency: every import/require/package in changed files must be
-      declared in a manifest or lock file in the repo, or be stdlib. Every NEW
-      dependency in a manifest must exist in the lock file with a resolved integrity hash,
-      and must be in the allowlist .ai-review/allowed-deps.txt (if the file exists).
-      Typo-squat check: edit distance ≤ 2 from a popular package name = finding.
-      Why: published research (USENIX Security 2025) found roughly 1 in 5 code samples from
-      16 models named a package that does not exist (about 5% for commercial models). Many
-      invented names repeat across runs, so attackers can register them
-      ("slopsquatting"). Offline controls: (a) a new dependency must be in the allowlist
-      or already resolved in the lock file with an integrity hash; (b) the name must exist in
-      the internal mirror index (/cache/mirror-index.txt), not only on the public registry;
-      (c) release-age cooldown: a version younger than 7 days (30 for new packages) in the
-      mirror metadata = finding; (d) package with < 1 year history or no repository link in
-      metadata = finding; (e) install scripts forbidden: `.npmrc` must have
-      `ignore-scripts=true` and `allow-git=none` (a git dependency can ship its own .npmrc
-      and re-enable scripts); builds use `npm ci --ignore-scripts` (or `pnpm install
-      --frozen-lockfile`), never `npm install`; (f) same rules for Maven (checksum/signature
-      verification on, no unknown repositories), pip (`--require-hashes`) and go (GONOSUMDB
-      unset, go.sum present).
-  G2  Hallucinated API: `tsc --noEmit`, `javac` (via mvn/gradle offline, dependencies
-      pre-seeded in /cache), `mypy`, `go vet` must pass. Type or compile failure = finding. Do not skip it.
-      ios: the Linux image cannot compile against Apple SDKs. G2 for ios is NOT RUN in
-      this pipeline. Document it in Assumptions. Require a separate macOS CI job
-      (`xcodebuild build-for-testing`). Do not claim iOS compile coverage.
-  G3  Suppression abuse: any new suppression comment without `rule-id: reason` is a
-      finding. Any change to a lint/CI/config file (eslint, swiftlint, swiftformat, pmd,
-      tsconfig strict flags, .semgrepignore, quality-gate.json, CI workflow) in the same
-      diff as source code is a finding "config change needs human review".
-  G4  Test integrity: new `.skip`, `xit`, `@Disabled`, `@Ignore`,
-      `t.Skip`, `pytest.mark.skip`, `XCTSkip`, disabled tests in .xctestplan; deleted or
-      weakened assertions (net negative `assert/expect` count in a
-      changed test file); tests with no assertion; mocks of the unit under test.
-  G5  Tests accompany code: a changed source file with logic changes needs a changed or
-      new test file in the same diff. Else finding.
-  G6  Diff size: > 400 changed lines or > 15 files in one change = finding "split the
-      change". Limits are in quality-gate.json under "guardrails".
-  G7  Dead and placeholder code: `TODO`, `FIXME`, `XXX`, `pass`-only bodies,
-      `NotImplementedError`, `fatalError("TODO")`, `throw new Error("not implemented")`,
-      `UnsupportedOperationException`, commented-out code
-      blocks ≥ 3 lines, `console.log`/`print`/`System.out` debug output, unused exports.
-  G8  Unsafe patterns AI often writes: `eval`/`exec`, `shell=True`, `innerHTML`,
-      `verify=False`, `rejectUnauthorized:false`, `chmod 777`, `0.0.0.0/0`, `latest` image
-      tags, `http://` URLs, `Math.random` for tokens, `md5`/`sha1` for security,
-      string-built SQL, catch-and-ignore, `except:` bare, `any` casts.
-  G9  Error handling and logging: every external call (http, db, fs, subprocess) has
-      error handling and a timeout. No secrets, tokens, or PII in log statements.
-  G10 Input validation: every new HTTP handler/route validates its input with a schema
-      library already in the manifest (zod, joi, pydantic, bean validation, Codable with
-      validation, etc.). Flag handlers that pass request data to a sink without
-      validation (taint rules).
-  G11 Binary and generated files: no new binary, minified, or vendored file; no file
-      > 1 MB; no lock file edit without a manifest edit (and the reverse).
-  G12 Provenance: a commit with a message trailer or file header marking AI authorship is
-      allowed. The guardrails run the same checks. Never relax a rule for AI or
-      human code.
-  G13 CI and build-file hygiene (workflow files in the diff or tree; zizmor offline mode
-      and actionlint when installed, else Semgrep YAML rules):
-      every `uses:` pinned to a 40-char commit SHA (tag only as a comment); top-level
-      `permissions: {}` or read-only with per-job scopes; no `pull_request_target` or
-      `workflow_run` that checks out PR head code; no `${{ github.event.* }}` / branch /
-      title / body interpolated into `run:` (pass through `env:`); no `secrets: inherit`;
-      no `curl | sh`; no self-hosted runner on public PR triggers; `persist-credentials:
-      false` on checkout; no long-lived cloud keys (use OIDC); no artifacts or caches
-      shared across trust boundaries. Same for GitLab CI / Jenkinsfile / Dockerfile
-      (`USER` set, digest-pinned FROM, no `ADD` of URLs, no secrets in ARG/ENV).
-      These map to OpenSSF Scorecard checks: Dangerous-Workflow, Token-Permissions,
-      Pinned-Dependencies, Binary-Artifacts, Code-Review, Branch-Protection.
-  G14 Untrusted-text and agent-config safety (OWASP LLM01/LLM05/LLM06: generated or fetched
-      text is untrusted input; an agent with too much power is a risk). Findings for:
-      hidden or bidi Unicode (U+202A–202E, U+2066–2069, zero-width characters) in source,
-      docs and agent files (AGENTS.md, CLAUDE.md, .cursorrules, .github/copilot-instructions.md,
-      MCP configs); instructions in comments or docs that tell a tool to ignore rules, disable
-      checks, fetch URLs, run commands or exfiltrate data; agent/MCP config granting broad
-      shell, write, or network permissions or `--dangerously-skip-permissions` style flags;
-      model output written straight into a shell, SQL, HTML, or file path without encoding or
-      validation (improper output handling). A change to an agent-config file needs human review (like G3).
-  G15 Exception handling quality (OWASP 2025 "Mishandling of Exceptional Conditions"):
-      catch-and-ignore, catch that returns success, fail-open authorization on error,
-      `finally` that swallows or throws, error messages that leak stack traces or internals,
-      missing timeouts/retries limits/circuit breakers on remote calls, unbounded retry loops,
-      resource not released on error path, generic `throw new Error()` with no cause.
-  Findings are SARIF (ruleId = guardrail id, level = error). Exit by the shared policy.
-
-6) CODING CONTRACT (the rules AI code must follow before it is written)
-Emit this block as .ai-review/rules/CONTRACT.md content inside the quality.yaml header
-comment AND as a system-prompt snippet in --help output, so a coding agent can read it:
-  - Smallest change that solves the task. Reuse existing helpers; search before adding.
-  - One responsibility per function/class. ≤ 50 lines, ≤ 4 params, nesting ≤ 4.
-  - Depend on abstractions; inject dependencies; no hidden globals.
-  - No duplicated logic; extract at the third copy. No magic numbers or literal URLs.
-  - Handle every error path. Validate every external input. Parameterize every query.
-  - No new dependency without need; prefer stdlib. Never invent an API: verify it exists.
-  - Never edit lint, CI, or gate config to make code pass. Never skip or weaken a test.
-  - Add or update tests for every behavior change. Keep names clear; no abbreviations.
-  - Write docs and comments in short sentences. One idea each. Explain why, not what.
-    No filler words. Keep docs true: update them in the same change as the code.
-
-7) ai-review.sh (host bootstrapper)
-- set -euo pipefail. If docker is missing or the daemon is unreachable, exit 2.
-- cd "$(git rev-parse --show-toplevel)". mkdir -p .ai-review/.cache .ai-review/artifacts.
-- IMAGE="${AI_REVIEW_IMAGE:-$(cat .ai-review/image.digest 2>/dev/null)}"; empty → exit 2
-  "run .ai-review/resolve.sh and build first". Reject a ref without @sha256:.
-  `docker image inspect "$IMAGE"` fails → exit 2 "load image first".
-- Source mount: /src:ro by default, rw only when --fix is passed.
-- docker run --rm --pull=never \
-    --user "$(id -u):$(id -g)" \
-    --memory 4g --memory-swap 4g --cpus 2 --pids-limit 512 \
-    --cap-drop ALL --security-opt no-new-privileges \
-    --read-only --tmpfs /tmp:rw,nosuid,size=2g \
-    --network none \
-    -v "$PWD:/src:$SRC_MODE" \
-    -v "$PWD/.ai-review/.cache:/cache" \
-    -v "$PWD/.ai-review/artifacts:/artifacts" \
-    -e GITLEAKS_BASELINE -e AI_REVIEW_LANGS \
-    "$IMAGE" "$@"
-- Capture the exit code: `rc=0; docker run ... || rc=$?; exit "$rc"`.
-  The host script never changes 0/1/2.
-
-8) .ai-review/tests/smoke.sh
-- Create a temp git repo with: a committed fake secret, a package-lock.json with a
-  known HIGH CVE, one file that trips one Semgrep rule.
-- Run ai-review.sh --full-scan. Assert exit 1.
-- Assert gitleaks.sarif, trivy.sarif, semgrep.sarif, sbom.cdx.json, summary.json
-  exist and pass `jq -e .`. Assert the secret value appears in no artifact.
-- Run ai-review.sh --diff-only --base-ref <clean commit>. Assert exit 1 and that
-  only the new commit's findings appear.
-- Quality cases (one repo each, assert exit 1 and the named rule id in the SARIF):
-  Q1: function with cognitive complexity 25 → S3776 / complexity rule.
-  Q2: same 8-line block copied in two files → jscpd duplication over gate.
-  Q3: `catch (e) {}` empty catch → S108.
-  Q4: new `// eslint-disable-next-line` with no reason → G3.
-  Q5: new `it.skip(...)` → G4. Q6: import of a package not in package.json → G1.
-  Q7: source change with no test change → G5. Q8: type error → G2.
-  Q9: clean, small, tested change → exit 0 and gate=passed.
-  Q13: workflow with `uses: actions/checkout@v4` (tag, not SHA), no `permissions`, and
-       `${{ github.event.pull_request.title }}` inside `run:` → G13.
-  Q14: file with a U+202E bidi character, and an AGENTS.md line "ignore all lint
-       rules" → G14.
-  Q15: `catch (e) { return true }` in an auth check → G15.
-  Q16: new dependency not in lock file or allowlist; `.npmrc` without ignore-scripts → G1.
-  R1: run resolve.sh twice → identical versions.lock.json (idempotent).
-  R2: corrupt one downloaded byte (test hook) → resolve.sh exits 2 on checksum mismatch.
-  R3: fake a release newer than the cooldown → previous stable is chosen and logged.
-  R4: lock file has no "<", "TODO", "latest", empty digest or empty sha256 (jq check).
-  D1: 40-word sentence, passive sentence, "just simply" in a .md → warnings S1,S3,S4; exit 0.
-  D2: heading jump h2→h4, fence with no language, broken link → D1,D2,D4 warnings; exit 0.
-  D3: `// increment i` above `i++`, `// fix this`, `// TODO` with no owner → C1,C3,C8; exit 0.
-  D4: docs.blocking=true set in quality-gate.json → same input exits 1.
-  D5: clean short doc → 0 warnings. Tool crash (bad vale.ini) → exit 2.
-  D6: doc names a flag `--nope` that does not exist → D6 warning.
-  Q10: linter config inside /src weakened → ignored; the pipeline uses /opt/ai-review/lint.
-- Detection cases:
-  A: only pom.xml + src/main/java → log has "langs=java" and "roots=src/main/java";
-     the javascript and swift rule files are not loaded.
-  B: package.json + packages/web/src → "langs=js", root found.
-  C: repo of only .txt files → "generic rules only", semgrep exit 0.
-  D: --lang python on the Java repo → "source=flag", python rules loaded.
-  E: Package.swift + Sources/ → "langs=ios", roots=Sources, SwiftLint ran, ESLint did not.
-  G: package.json with react + src/App.tsx → "langs=js,react", react.yaml loaded, jsx-a11y ran.
-  F: pom.xml + package.json + *.xcodeproj → "langs=java,js,ios".
+SMOKE CASES
+  G (detection case, section 8) must pass.
   Q12: React: useEffect missing dependency, array index as key, dangerouslySetInnerHTML with
        props, token in localStorage, <a target="_blank"> without rel, click handler on <div> → each flagged.
-  Q11: `let x = y!` force unwrap and `NSAllowsArbitraryLoads=true` in Info.plist → both flagged.
+  RE1 advisory: useEffect + useState fetch pair → advisory result, exit unchanged.
 
-9) CI INTEGRATION (the tool wires itself into the CI the repo already uses)
-Contract for every CI: fetch base branch → run ./ai-review.sh → read exit code (0/1/2)
-→ upload SARIF + artifacts. No CI-specific logic lives in pipeline.sh.
-- `./ai-review.sh --init-ci [auto|github|gitlab|generic] [--write]`:
-  - auto: detect from repo files, first match wins, log "ci detected: <name>":
-      .github/workflows/        → github
-      .gitlab-ci.yml            → gitlab
-      Jenkinsfile               → generic (emit a stage snippet)
-      bitbucket-pipelines.yml, azure-pipelines.yml, .circleci/config.yml,
-      .buildkite/              → generic (emit a step snippet)
-      none found                → generic, plus print "no CI found".
-    If no CI file exists, also read the remote URL (`git remote get-url origin`):
-    github.com → github, gitlab → gitlab.
-  - Without --write: print the snippet and the target path (dry run, default).
-  - With --write: create a NEW file only (.github/workflows/ai-review.yml,
-    .gitlab/ai-review.gitlab-ci.yml + one `include:` line printed for the user to add).
-    Never edit or overwrite an existing CI file. Existing target → exit 2 with the path.
-- Templates in .ai-review/ci/ must follow guardrail G13: actions pinned by full SHA
-  (resolved by resolve.sh from the action's latest release tag, tag kept as a comment),
-  `permissions: {}` then per-job minimum, no `pull_request_target`, no untrusted
-  `${{ }}` in `run:`, `persist-credentials: false`, `fetch-depth: 0`.
-- Each template must do, per provider:
-  github:  trigger pull_request + push to default branch; `git fetch origin $BASE_REF`;
-           run diff mode on PRs, full scan on push to default and on a weekly schedule;
-           upload each *.sarif with github/codeql-action/upload-sarif (category = tool name),
-           needs security-events: write; upload artifacts; job summary from summary.json;
-           fork PRs: run without secrets, never use pull_request_target.
-  gitlab:  merge_request_event + default branch; `git fetch origin $CI_MERGE_REQUEST_TARGET_BRANCH_NAME`;
-           artifacts: paths .ai-review/artifacts/, `reports: sast` for semgrep SARIF→ gl-sast
-           conversion only if a verified converter exists (else keep SARIF as plain artifacts
-           and say so); allow_failure false; cache key = trivy db date.
-  generic: a POSIX sh script that does fetch, run, archive, and maps exit 1 and 2 to a failed
-           build. Include copy-paste snippets for Jenkins, Bitbucket, Azure, CircleCI as
-           comments, each marked UNTESTED unless smoke-tested.
-- --init-ci prints runner requirements: Docker, the image (by digest from image.digest
-  or AI_REVIEW_IMAGE), the lock file, and a fresh .ai-review/.cache/trivy. Also emit a
-  scheduled-job snippet that re-runs resolve.sh and opens a PR with the lock-file diff.
-- Image delivery in CI: pull by digest from the registry, or `docker load` an artifact.
-  Do not build the image inside the scan job.
-- Branch protection: print (do not apply) the settings that make the check required.
-- Smoke tests: I1 repo with .github/workflows → "ci detected: github" and a dry-run
-  snippet with SHA-pinned actions only (grep: no `@v`, no `@main`). I2 .gitlab-ci.yml → gitlab.
-  I3 no CI file → generic. I4 --write on an existing target → exit 2, file unchanged.
-  I5 --write on a clean repo creates exactly one new file.
+LIMITS
+- Library and architecture choices are advisory (4h). They do not fail the run.
+- Bundle size checks run only on a committed budget file.
+
+PROFILE: IOS
+SCOPE
+Covers: Swift, SwiftPM, CocoaPods, Info.plist, entitlements.
+On when: detect_project() finds ios (Package.swift, Podfile, Cartfile, *.xcodeproj, *.xcworkspace, or ≥ 3 *.swift files).
+
+OUTPUT FILES (added to the OUTPUT TREE)
+.ai-review/lint/.swiftlint.yml
+.ai-review/lint/.swiftformat
+.ai-review/rules/swift.yaml
+.ai-review/tests/<rule-id>.{swift,plist} (one fixture per rule)
+
+TOOLS (resolve each with rule R; GitHub releases, static Linux binaries, SHA256)
+SwiftLint, SwiftFormat. No Xcode or Apple SDK in the image.
+Each in run_tool():
+  swiftlint lint --strict --config lint/.swiftlint.yml --reporter sarif
+  swiftformat --lint --config lint/.swiftformat
+  plist and entitlements checks (rules/swift.yaml)
+
+EXIT CODES
+swiftlint --strict 2 = findings (violations), 1 = infra (verify in Assumptions).
+swiftformat --lint 1 = findings, other = infra.
+
+LINT CONFIG
+- SwiftLint --strict. opt_in_rules: force_unwrapping, force_cast, force_try,
+    implicitly_unwrapped_optional, unused_import, unused_declaration (needs index; off,
+    say so), weak_delegate, no_print (custom regex for print/NSLog/debugPrint),
+    cyclomatic_complexity warn 10 / error 15, function_body_length 50, type_body_length
+    250, file_length 300, function_parameter_count 4, nesting 3, large_tuple 2,
+    identifier_name, discouraged_optional_collection, empty_count, fatal_error_message,
+    todo, custom rules for hardcoded http:// and secrets. SwiftFormat --lint with
+    a fixed ruleset. Use Swift 6 strict concurrency conventions (Sendable, @MainActor).
+
+SEMGREP RULES (rules/swift.yaml)
+New rules for the common CWE classes (injection, deserialization, hardcoded credentials,
+weak crypto, path traversal), plus:
+- ATS off (NSAllowsArbitraryLoads), secrets in UserDefaults/plist, Keychain
+  kSecAttrAccessibleAlways, URLSession trust-all (serverTrust without evaluation),
+  WKWebView JS bridge with remote content, UIWebView, CommonCrypto MD5/SHA1/DES,
+  insecure random (arc4random without secure use for tokens), NSLog/print of
+  sensitive data, http:// URLs, custom URL scheme without validation, pasteboard
+  with secrets, SQLite/CoreData string-built predicates (NSPredicate(format:)).
+  Reference OWASP MASVS in metadata.references.
+
+PROFILE RULES
+Baseline only: 4a-4c, with the LINT CONFIG above. Swift 6 strict concurrency
+conventions (Sendable, @MainActor).
+
+SMOKE CASES
+  E (detection case, section 8) must pass.
+  Q11: `let x = y!` force unwrap and `NSAllowsArbitraryLoads=true` in Info.plist → both flagged.
+  IO1 maintainability: function with 5 params → function_parameter_count.
+
+LIMITS
+- The Linux image cannot compile against Apple SDKs. G2 for ios is NOT RUN in
+  this pipeline. Document it in Assumptions. Require a separate macOS CI job
+  (`xcodebuild build-for-testing`). Do not claim iOS compile coverage.
+- Objective-C (*.m, *.h) is not covered. detect_project() logs "unsupported: objc".
+
+PROFILE: PYTHON
+SCOPE
+Covers: Python 3, pyproject, requirements files.
+On when: detect_project() finds python (pyproject.toml, requirements.txt, setup.py, or ≥ 3 *.py files).
+
+OUTPUT FILES (added to the OUTPUT TREE)
+.ai-review/lint/ruff.toml
+.ai-review/rules/python.yaml
+.ai-review/tests/<rule-id>.py        (one fixture per rule)
+
+TOOLS (resolve each with rule R; PyPI, `--require-hashes`)
+ruff, bandit, mypy. Each in run_tool():
+  ruff check --isolated --config lint/ruff.toml --output-format sarif
+  bandit -r <roots> -f sarif
+  mypy --strict (config from /opt/ai-review/lint, never from the repo)
+
+EXIT CODES
+ruff 1 = findings, 2 = infra. bandit 1 = findings, other = infra. mypy 1 = findings
+(G2), 2 = infra. Verify each in Assumptions.
+
+LINT CONFIG
+- ruff select = E,F,W,I,B,C90,S,SIM,UP,PL,RUF,ARG,ERA,T20,PTH,TRY,PERF,
+    mccabe ≤ 10, max-args 4, max-branches 12, max-statements 50. mypy --strict.
+    Bandit B1xx–B7xx all on.
+
+SEMGREP RULES (rules/python.yaml)
+New rules for the common CWE classes: injection (subprocess with shell=True, SQL string
+build), deserialization (pickle, yaml.load), hardcoded credentials, weak crypto, path
+traversal, SSRF (requests with user URL), `verify=False`.
+
+PROFILE RULES
+Baseline only: 4a-4c, with the LINT CONFIG above. Supply chain: G1 (f) pip
+`--require-hashes`.
+
+SMOKE CASES
+  D (detection case, section 8) must pass.
+  PY1 security: subprocess.run(shell=True) with user input → finding.
+  PY2 reliability: bare `except:` → finding. PY3 maintainability: mccabe 11 → C901.
+  PY4 tests: new `pytest.mark.skip` → G4.
+
+LIMITS
+- Type checks need a .venv installed with `--require-hashes` (section 2).
+- No framework profile (Django, Flask, FastAPI): generic rules only.
+
+PROFILE: GO
+SCOPE
+Covers: Go modules.
+On when: detect_project() finds go (go.mod, or ≥ 3 *.go files).
+
+OUTPUT FILES (added to the OUTPUT TREE)
+.ai-review/lint/golangci.yml
+.ai-review/rules/go.yaml
+.ai-review/tests/<rule-id>.go        (one fixture per rule)
+
+TOOLS (resolve each with rule R; GitHub releases)
+golangci-lint, go (toolchain pinned in the lock file). Each in run_tool():
+  golangci-lint run -c lint/golangci.yml --out-format sarif
+  go vet ./...
+Env: GOTOOLCHAIN=local GOFLAGS=-mod=readonly GOPROXY=off (section 2).
+
+EXIT CODES
+golangci-lint 1 = findings, other = infra. go vet 1 = findings (G2), other = infra.
+
+LINT CONFIG
+- golangci-lint enable errcheck, govet, staticcheck, gosec, revive, gocyclo ≤ 10,
+    gocognit ≤ 15, dupl, funlen, nestif, ineffassign, unused, gofumpt, bodyclose, noctx.
+
+SEMGREP RULES (rules/go.yaml)
+New rules for the common CWE classes: injection (exec.Command with user input, SQL string
+build), hardcoded credentials, weak crypto (md5, sha1, math/rand for tokens), path
+traversal, SSRF, TLS InsecureSkipVerify.
+
+PROFILE RULES
+Baseline only: 4a-4c, with the LINT CONFIG above. Supply chain: G1 (f) go.sum
+present, GONOSUMDB unset.
+
+SMOKE CASES
+  GO1 security: InsecureSkipVerify: true → finding. GO2 reliability: unchecked error →
+  errcheck. GO3 maintainability: gocognit 16 → finding. GO4 tests: new t.Skip → G4.
+
+LIMITS
+- Type checks need the module cache from `go mod download` (section 2).
+- cgo code is checked as Go only.
 
 ACCEPTANCE
 Zero placeholders. Every Sonar-equivalent rule in 4a maps to a real rule id in a named
 tool, listed in Assumptions. Write a rule with no real equivalent as a Semgrep rule
 with a fixture. Do not claim coverage that is not implemented. List every Validate command.
 List every assumption. smoke.sh is the definition of done.
+- Every rule, guardrail and tool check has one row in .ai-review/rules/registry.json
+  (section 4h) with one axis. A rule with no row, or a row with no fixture, fails smoke R5.
+- Each axis (security, reliability, maintainability, tests) has at least one failing smoke
+  case (V1-V4). Each tamper control in the TRUST MODEL has a smoke case (H1-H11).

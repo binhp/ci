@@ -15,15 +15,12 @@ follow ASD-STE100 Simplified Technical English (STE).
 
 ### Style: STE plus caveman
 
-Write short. Cut filler. Say one thing, then stop.
+Base rules: `llm.txt` section WRITING STYLE. Do not copy them here.
+Rules below add to the base rules for this repo.
 
-- Keep STE grammar. Add caveman terseness on top.
-- Drop filler words: "in order to", "please", "note that", "it is important", "basically".
-- In list items, tables, and comments, you may drop articles. Keep them in procedure
-  sentences if the meaning is not clear without them.
 - Prefer a short fragment to a full sentence in a list. Write "Fail on exit 2." not "The script should fail when the exit code is 2."
-- Do not drop a number, unit, flag, path, or rule id. Do not make the text unclear.
-- Do not change a rule, a value, or a name when you shorten text.
+- Findings in a review of this repo: use the finding line in `llm.txt` WRITING STYLE.
+  Write "llm.txt:478: high run_tool output on console. Write it to the log only."
 
 ### Sentences
 
@@ -90,6 +87,8 @@ Write short. Cut filler. Say one thing, then stop.
 
 ## Commit messages
 
-- Write a subject of 50 characters or fewer, in the imperative. Write "Add CI detection".
+- Write one line in Conventional Commit form: `<type>: <subject>`. Types: feat, fix,
+  docs, refactor, test, chore.
+- Write a subject of 50 characters or fewer, in the imperative. Write "docs: add CI detection".
 - Add a body only if the reason is not clear. Write why, not what.
 - Do not add attribution lines.
