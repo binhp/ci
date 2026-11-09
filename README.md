@@ -3,8 +3,9 @@
 One offline container. Scans AI-written and human code before merge on 4 axes: security,
 reliability, maintainability, tests. Works with any coding flow and any CI.
 
-> **Status:** this repo has the spec only: [`llm.txt`](llm.txt). A coding agent builds
-> the pipeline from it. Nothing has run yet. Trust only what `.ai-review/tests/smoke.sh` proves.
+> **Status:** this repo has the spec, [`llm.txt`](llm.txt), and the scan image file,
+> [`.ai-review/Dockerfile`](.ai-review/Dockerfile). A coding agent builds the other files from
+> the spec. The image does not build until they exist. Trust only what `.ai-review/tests/smoke.sh` proves.
 
 ## What it scans
 
@@ -32,7 +33,8 @@ No manual values. The tool finds them.
    To build fewer stacks, add `stacks=java,js` to the prompt.
 2. Run `.ai-review/resolve.sh`. It finds the latest versions, URLs, digests, checksums.
    It verifies them. It writes `versions.lock.json`. Commit it. Review the diff.
-3. Run `.ai-review/build.sh`. It builds and signs the image. It writes `.ai-review/image.digest`.
+3. Run `.ai-review/build.sh`. It builds [`.ai-review/Dockerfile`](.ai-review/Dockerfile) with the
+   values from `versions.lock.json`. It signs the image and writes `.ai-review/image.digest`.
    Then it finds your CI and asks one question: add the scan to CI? See [Add to CI](#add-to-ci).
 4. Run `bash .ai-review/tests/smoke.sh`. It must pass.
 
@@ -48,6 +50,35 @@ Rules and limits: `llm.txt` section P.
 Windows: run `wsl --install` in an admin PowerShell first. Then use the Ubuntu shell.
 Network is needed for steps 2–3 only. The scan is offline.
 
+### Use Apple container (macOS)
+
+The pipeline also runs on [Apple container](https://github.com/apple/container) 1.6.0 or later.
+It needs macOS 26 or later on Apple silicon. Rules: `llm.txt` section 7 RUNTIME.
+
+1. Set the runtime: `export AI_REVIEW_RUNTIME=container`.
+2. Run `.ai-review/doctor.sh`. If `container` is missing, it installs the Apple-signed package.
+3. Do the 4 setup steps above. `build.sh` uses `container build`.
+
+Default `AI_REVIEW_RUNTIME=auto` uses Docker first, then Apple container.
+
+> **Warning:** The Apple container runtime has no no-new-privileges, no seccomp filter and
+> no pids cgroup. The scan prints this warning on each run. Use Docker in CI.
+
+## Build the image
+
+`build.sh` runs the build. Do not build by hand: each tool needs 3 build args from the lock file.
+Rules: `llm.txt` section 1. The build context is `.ai-review/`.
+The Dockerfile has a default `BASE_IMAGE` pinned by digest. `resolve.sh` keeps it equal to the lock file.
+
+The build needs these files in `.ai-review/`. If one is missing, the build stops.
+
+- `versions.lock.json`, `.cache/trivy/`, `.cache/data/`, `.cache/npm/`, `.cache/pypi/` (from `resolve.sh`)
+- `pipeline.sh`, `guardrails.sh`, `quality-gate.json`, `.semgrepignore`
+- `lint/`, `rules/`, `tests/`
+
+The Dockerfile installs the tools for all stacks: Java, JS/TS, React, iOS, Python, Go.
+The image runs as user `10001`, not root.
+
 ## Run
 
 ```bash
@@ -55,6 +86,7 @@ Network is needed for steps 2–3 only. The scan is offline.
 ./ai-review.sh --diff-only --base-ref origin/main   # committed changes only
 ./ai-review.sh --lang java,js,react                 # override detection
 ./ai-review.sh --init-ci                            # wire into CI (dry run)
+AI_REVIEW_RUNTIME=container ./ai-review.sh --full-scan   # Apple container
 ```
 
 For diff mode: run `git fetch origin main` first. Commit your changes first.
@@ -86,6 +118,7 @@ Do not edit lint, CI, or gate config to pass."*
 ## Limits
 
 - iOS compile check needs macOS. Objective-C and Kotlin: not covered.
+- Apple container: local use only. CI uses Docker. A local build has no provenance and no SBOM.
 - Static analysis does not replace review, tests, or threat modeling.
 - Rule names change between tool versions. Smoke case R5 checks each name.
 - On GitHub, a PR can edit its own workflow file. Only CODEOWNERS review and an org

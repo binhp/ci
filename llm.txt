@@ -134,25 +134,28 @@ Dockerfile build args, ai-review.sh and README READ the lock file.
 - Base image: resolve the newest patch tag of the chosen distro line (e.g. debian
   `stable-slim`) to its digest with `docker buildx imagetools inspect` (or `crane digest`).
   Write `image@sha256:…` into the lock file. If the image has a cosign signature, verify it.
-- Trivy DB: run `trivy image --download-db-only` and `--download-java-db-only` into
-  .ai-review/.cache/trivy. Record DB `UpdatedAt` and the SHA256 of each DB file in the lock
-  file. build.sh bakes the DB into the image (section 1). If the DB is older than
-  14 days, fail the later scan (exit 2) (override: AI_REVIEW_MAX_DB_AGE_DAYS). The publish
-  job (section 9) rebuilds weekly. 14 days gives 7 days to merge its PR. After 10 days,
-  the scan prints a warning "trivy DB is <n> days old: merge the publish PR".
+- Trivy DB: the Dockerfile downloads it in build stage `trivy-db` (section 1). resolve.sh does
+  not. If the DB is older than 14 days, fail the later scan (exit 2) (override:
+  AI_REVIEW_MAX_DB_AGE_DAYS). The publish job (section 9) rebuilds weekly. 14 days gives 7
+  days to merge its PR. After 10 days, the scan prints a warning "trivy DB is <n> days old:
+  rebuild the image".
 - OS package snapshot: record a snapshot.debian.org timestamp (or the Alpine repository
   tag) in the lock file. The Dockerfile installs OS packages from it.
-- Package data for G1: write .ai-review/.cache/data/<ecosystem>-index.json and
-  <ecosystem>-top.txt (section 5, G1). Record each source URL and SHA256 in the lock file.
+- Package data for G1 (optional): write .ai-review/data/<ecosystem>-index.json and
+  <ecosystem>-top.txt (section 5, G1). Record each path, source URL and SHA256 in data[].
+  If data[] is empty, the image has no index. G1 checks (b)-(d) are then `not_evaluated`.
 - Signing identity: record the cosign keyless identity (issuer, subject regex) of the
   publish job in the lock file. CI verifies the image against it.
 - `--seed-java`: fill the Java cache (PROFILE: JAVA, PROFILE RULES). Run it only on a trusted ref.
 - Lock file schema: .ai-review/schema/versions.lock.schema.json. resolve.sh validates its
   output against it before it writes. Top-level keys: schema_version, generated_at,
-  cooldown_days, base_image, os_snapshot, tools[], npm, pypi, maven, actions[], trivy_db,
-  data[], signing. Each tool: {name, version, published_at, url, sha256, signature:
-  verified|none, source}.
-- Runtime image ref: after `docker buildx build`, write the digest to
+  cooldown_days, base_image, os_snapshot, tools[], npm, pypi, maven, actions[], data[],
+  signing. Each tool: {name, version, published_at, assets, signature: verified|none, source}.
+  assets: {amd64: {url, sha256}, arm64: {url, sha256}}, or {all: {url, sha256}} for an
+  arch-independent file (jar, zip of scripts). Each data[] item: {path, url, sha256}, path
+  relative to .ai-review/. npm: {registry, files[]}. pypi: {index_url, files[]}. Each file:
+  {path, sha256}, path relative to .ai-review/ (lock/npm/*, lock/pypi/*).
+- Runtime image ref: after the build (section 7 RUNTIME), write the digest ref to
   .ai-review/image.digest. ai-review.sh reads AI_REVIEW_IMAGE, else that file. Nobody types it.
 - Idempotent: if upstream is unchanged, two runs of resolve.sh produce an identical lock
   file. Output a human diff of changes (old → new version, published_at, checksum).
@@ -178,9 +181,10 @@ missing ones or prints exact steps for this OS. The user does not read a list or
     CI:      `CI`, `GITHUB_ACTIONS`, `GITLAB_CI`, `JENKINS_URL` set → non-interactive.
 - Tools per phase. Build this table from the commands the other files run on the host.
   Do not copy it from README. Each tool counts as present only if its version command passes:
-    scan:    bash, git, docker (daemon reachable: `docker info`).
-    ci:      scan tools.
-    build:   scan tools, docker buildx, cosign.
+    scan:    bash, git, one container runtime (section 7 RUNTIME): docker (daemon
+             reachable: `docker info`) or Apple container (`container system status`).
+    ci:      scan tools, docker runtime only.
+    build:   scan tools, cosign, and docker buildx (docker runtime) or container (Apple runtime).
     resolve: build tools, curl, jq, gh, tar, a SHA256 tool, crane (only if buildx
              imagetools is missing). npm, pip-compile, mvn: only for stacks found by
              detect_project() (section 2), and only if resolve.sh runs them on the host.
@@ -205,7 +209,13 @@ missing ones or prints exact steps for this OS. The user does not read a list or
     macOS, no brew: download the Homebrew .pkg from the Homebrew GitHub release with rule R.
       Install it with `sudo installer -pkg <file> -target /`. If no .pkg asset exists, use
       step 3. Do not run the `curl | bash` one-liner.
-    macOS, no docker: install the colima, docker and docker-buildx formulae. Run
+    macOS, AI_REVIEW_RUNTIME=container, no `container`: needs macOS 26 or later on arm64.
+      Else exit 2 with "Apple container needs macOS 26 on Apple silicon". Download the
+      container-<version>-installer-signed.pkg asset from apple/container with rule R.
+      `pkgutil --check-signature` must name "Developer ID Installer: Apple Inc.". Install it
+      with `sudo installer -pkg <file> -target /`. Then run `container system start`.
+    macOS, no docker, AI_REVIEW_RUNTIME not container: install the colima, docker and
+      docker-buildx formulae. Run
       `colima start --cpu <n> --memory <GiB>` with n ≥ AI_REVIEW_CPUS + 1 and GiB ≥
       AI_REVIEW_MEMORY + 2 (section 7). If colima runs with less, print the restart command.
       Reason: Docker Desktop needs a GUI license accept on the first run. If Docker Desktop
@@ -248,6 +258,9 @@ OUTPUT TREE (exactly these files plus the OUTPUT FILES of each selected profile,
 .ai-review/build.sh                 (host: buildx from the lock file, writes image.digest, offers CI
                                      setup; in the publish job also pushes and signs, section 9)
 .ai-review/versions.lock.json       (generated by resolve.sh, committed)
+.ai-review/lock/npm/package.json     (npm tool list, generated by resolve.sh, committed)
+.ai-review/lock/npm/package-lock.json (npm lock with integrity hashes, committed)
+.ai-review/lock/pypi/requirements.txt (universal pip lock with hashes, committed)
 .ai-review/schema/versions.lock.schema.json
 .ai-review/schema/summary.schema.json
 .ai-review/image.digest             (generated by a local build, git-ignored)
@@ -354,27 +367,59 @@ EXIT POLICY (shared by pipeline.sh and every host script; host scripts pass it t
   Its tool status is `warnings`, not `findings`. Exit 0 with warnings stays exit 0.
   A docs-lint tool crash is still infra: exit 2.
 1) .ai-review/Dockerfile
-- FROM pinned by digest. Distro-correct syntax (addgroup/adduser -S on Alpine).
-- Build args come from versions.lock.json (build.sh passes them). ARG GITLEAKS_VERSION GITLEAKS_SHA256 TRIVY_VERSION TRIVY_SHA256 MIRROR_URL, and
-  the same for every other tool in the lock file.
-  Empty ARG fails the build: `: "${X:?}"`.
-- Download from MIRROR_URL. `echo "$SHA  file" | sha256sum -c -` in the SAME RUN.
+- Build context: .ai-review/. build.sh runs `docker buildx build -f .ai-review/Dockerfile .ai-review`,
+  or `container build` with the Apple runtime (section 7 RUNTIME).
+  Each COPY path is relative to .ai-review/.
+- FROM pinned by digest: `ARG BASE_IMAGE=<lock file base_image>`, then `FROM ${BASE_IMAGE}`.
+  Form: `<image>:<patch tag>@sha256:<digest>`. A value without @sha256: fails the build.
+  resolve.sh writes the same value into the ARG default when it writes the lock file.
+  build.sh passes the lock file value. If the default differs from it, build.sh exits 2. Distro-correct syntax (addgroup/adduser -S on Alpine).
+- Tool values come from the committed .ai-review/versions.lock.json. The Dockerfile reads it with
+  jq. It has no per-tool ARG, so a plain `docker build .ai-review` works. One source: the lock.
+  tools[].name values: gitleaks, trivy, actionlint, vale, golangci-lint, swiftlint,
+  swiftformat, jdk, node, go, maven, gradle, pmd, spotbugs, checkstyle, findsecbugs,
+  fb-contrib. A stack not selected drops its names.
+- Arch: TARGETARCH (amd64 or arm64, set by BuildKit). Each tool uses assets.<arch>, else
+  assets.all. Other arch → exit 2. Native arm64 builds on Apple silicon need no emulation.
+- ARGs (all optional; build.sh passes them):
+    MIRROR_URL      empty = upstream
+    VCS_SOURCE      `git remote get-url origin`, for the OCI label
+    VCS_REVISION    `git rev-parse HEAD`, for the OCI label
+    IMAGE_VERSION   `git describe --tags --always`, for the OCI label
+- URL: the lock file url. Do not build a URL from a template. If MIRROR_URL is set, it replaces
+  the scheme and host of the url. HTTPS only.
+- Download. `echo "$SHA  file" | sha256sum -c -` in the SAME RUN.
   Install to /opt/ai-review/bin, delete temp files, run `<tool> --version`.
 - PATH=/opt/ai-review/bin:$PATH. Pinned tools win over bundled copies.
 - Install the quality tools from the lock file the same way (mirror + SHA256, or offline
   lockfile install with --ignore-scripts / --no-index --require-hashes). Pin versions.
-  Install JDK and Node only if a tool needs them. Pin versions. SwiftLint and SwiftFormat
+  npm and pip lock files (resolve.sh writes them, committed): lock/npm/package.json,
+  lock/npm/package-lock.json → `npm ci --ignore-scripts` in /opt/ai-review (node_modules
+  there, so lint/eslint.config.mjs finds its plugins). lock/pypi/requirements.txt (universal,
+  hashes for amd64 and arm64 wheels) → `pip install --require-hashes --no-deps
+  --only-binary=:all:` into /opt/ai-review/venv. Before the install, check each lock file
+  against npm.files[] and pypi.files[].
+  Install JDK and Node only if a tool needs them. Pin versions. Stage 1 runs in the same image:
+  install mvn and gradle from the lock file. SwiftLint and SwiftFormat
   use the static Linux binaries from the mirror (SHA256). No Xcode or Apple SDK in the image.
   COPY lint/ and quality-gate.json and guardrails.sh → /opt/ai-review/ (read-only, root-owned).
 - jq, git, coreutils `timeout` present. If one is missing, fail the build.
 - OS packages: apt sources point at snapshot.debian.org with the timestamp from the
   lock file (Alpine: the pinned repository tag). Pinned versions then stay available.
-- Trivy DB: COPY .ai-review/.cache/trivy → /opt/ai-review/trivy-db (read-only, root-owned).
-  Check its SHA256 against the lock file in the same RUN. The DB is part of the image
-  digest. No cache volume can change it.
-- Package data: COPY .ai-review/.cache/data → /opt/ai-review/data (G1 index and top lists).
+  The snapshot is the version pin. Do not write `pkg=version`. Disable hadolint DL3008 on that
+  RUN only, with this reason in a comment. apt checks the Release signature, so http is allowed.
+- Trivy DB: build stage `trivy-db` runs the pinned trivy with `--download-db-only` and
+  `--download-java-db-only`. COPY the result → /opt/ai-review/trivy-db (read-only,
+  root-owned). Write the SHA256 of each DB file and `UpdatedAt` to
+  /opt/ai-review/trivy-db.sha256 in the same RUN. Pre-flight (section 2) checks the DB
+  against that file. The DB is part of the image digest. No cache volume can change it.
+  Refresh: `docker build --no-cache-filter trivy-db .ai-review`.
+  Limit (TRUST MODEL): no PR reviews the DB SHA256. Trust = trivy's own download from its
+  registry. The age check (rule R) still applies.
+- Package data: if data[] is not empty, COPY data/ → /opt/ai-review/data and check each
+  SHA256 against data[]. Else the image has no G1 index (section 5, G1).
 - COPY versions.lock.json → /opt/ai-review/versions.lock.json. Runtime checks compare with
-  this copy, never with the repo copy.
+  this copy, never with the repo copy. Write its SHA256 to /opt/ai-review/lock.sha256.
 - COPY lint/gitleaks.toml, lint/gitleaksignore, lint/trivy.yaml, lint/trivyignore.
 - User scanner 10001:10001, no login shell. /cache and /artifacts: mode 1777,
   because the runtime UID is the host UID.
@@ -388,7 +433,7 @@ EXIT POLICY (shared by pipeline.sh and every host script; host scripts pass it t
   GIT_OPTIONAL_LOCKS=0 GIT_CONFIG_NOSYSTEM=1
   Do not use safe.directory=*. Git config from the repo .git/config must not run code.
 - No ADD, no secrets in layers, package caches cleaned, package versions pinned.
-- OCI LABELs: source, revision, version, licenses, and the lock-file SHA256.
+- OCI LABELs: source, revision, version, licenses. A label ARG can be empty in a plain build.
 - COPY pipeline.sh, rules/, .semgrepignore, tests/ → /opt/ai-review/.
 - ENTRYPOINT ["/opt/ai-review/pipeline.sh"]. USER 10001:10001 last.
 
@@ -400,10 +445,12 @@ EXIT POLICY (shared by pipeline.sh and every host script; host scripts pass it t
   --update-baseline (section 4c).
   --lang LIST (comma-separated, e.g. java,js,react,ios,python,go). -h/--help. Unknown flag → exit 2.
 - Pre-flight. Each failure exits 2 with a message in WRITING STYLE:
+    Network: /sys/class/net has `lo` only. Else "network not isolated: run with --network none".
+      This check works on each runtime (section 7 RUNTIME).
     /src is a git repo.
     /artifacts writable.
     trivy DB in /opt/ai-review/trivy-db exists.
-    DB SHA256 equals the value in /opt/ai-review/versions.lock.json (copy in the image).
+    DB SHA256 equals the value in /opt/ai-review/trivy-db.sha256 (written at build).
     DB age ≤ AI_REVIEW_MAX_DB_AGE_DAYS (default 14).
     Diff mode: `git -C /src rev-parse --verify REF` passes.
       Message: "fetch on host first: git fetch origin main".
@@ -778,6 +825,8 @@ and a test in tests/guardrails.sh. Run on the diff (diff mode) or the tree (full
         `review` (exit 0), with "new dependency <name>: age, history and repository not
         verified offline; reviewer checks them". The next publish job adds it to the index.
         Else → finding "unknown package <name>: add it to .ai-review/allowed-deps.txt".
+      No index in the image for that ecosystem → (b)-(d) are `not_evaluated` with the warning
+      "no package index for <ecosystem>". (a), (e) and (f) still run.
       Typo-squat reference list: /opt/ai-review/data/<ecosystem>-top.txt. resolve.sh builds
       it from an official public source per ecosystem and records the URL in the lock file.
       If no official source exists for an ecosystem, the check compares against the
@@ -891,7 +940,7 @@ agent can read it (no separate file):
 - Image ref, first non-empty wins: AI_REVIEW_IMAGE, .ai-review/image.digest (local build),
   .ai-review/image.ref (committed, written by the publish job). Empty → exit 2
   "run .ai-review/resolve.sh and build first". Reject a ref without @sha256:.
-  `docker image inspect "$IMAGE"` fails → exit 2 "load image first".
+  Image check (RUNTIME below) fails → exit 2 "load image first".
 - Limits from env (defaults): AI_REVIEW_MEMORY=4g, AI_REVIEW_CPUS=2, AI_REVIEW_TMP_SIZE=2g,
   AI_REVIEW_TIMEOUT=3600 (whole run, seconds), AI_REVIEW_TOOL_TIMEOUT=900 (per tool).
   Validate each value with a regex. Bad value → exit 2.
@@ -913,7 +962,10 @@ agent can read it (no separate file):
     build logic (build.gradle*, settings.gradle*, buildSrc/, gradle/, .mvn/, and the
     <build>, <plugins>, <pluginRepositories>, <repositories>, <profiles> parts of pom.xml).
     A human then reviews each change to it.
-- Common docker run flags for both stages:
+- RUNTIME. AI_REVIEW_RUNTIME=auto|docker|container (default auto). auto: docker if
+  `docker info` passes, else Apple container if `container system status` passes. Else exit 2
+  "no container runtime: run .ai-review/doctor.sh". Log "runtime: <name>". CI: docker only.
+- Docker runtime. Image check: `docker image inspect "$IMAGE"`. Flags for both stages:
     docker run --rm --pull=never \
       --user "$(id -u):$(id -g)" \
       --memory "$AI_REVIEW_MEMORY" --memory-swap "$AI_REVIEW_MEMORY" \
@@ -926,6 +978,36 @@ agent can read it (no separate file):
       "$IMAGE" --stage build|scan "$@"
   Stage 2 adds `-v "$PWD/.ai-review/artifacts:/artifacts"`.
   The cache mount: stage 1 only (/cache for m2, gradle, npm). Stage 2 needs no cache.
+- Apple container runtime (github.com/apple/container). macOS 26 or later, arm64, CLI 1.6.0
+  or later. Each container runs in its own Linux VM. Flags for both stages:
+    container run --rm --progress none --platform linux/amd64 \
+      --user "$(id -u):$(id -g)" \
+      --memory "$AI_REVIEW_MEMORY" --cpus "$AI_REVIEW_CPUS" \
+      --ulimit nproc=512:512 \
+      --cap-drop ALL \
+      --read-only --tmpfs "/tmp:rw,nosuid,size=$AI_REVIEW_TMP_SIZE" \
+      --network none \
+      -v "$PWD:/src:ro" \
+      -e AI_REVIEW_LANGS -e AI_REVIEW_TIMEOUT -e AI_REVIEW_TOOL_TIMEOUT \
+      "$IMAGE" --stage build|scan "$@"
+  Stage 2 and the cache mount: same as the docker runtime.
+  Docker flag → Apple container (tested on 1.6.0):
+    --pull=never             none. `container run` pulls a missing image. Use the image check.
+    --memory-swap            none. The VM has no swap (SwapTotal 0 kB).
+    --pids-limit 512         --ulimit nproc=512:512 (per UID). The VM has no pids cgroup.
+    no-new-privileges        none. NoNewPrivs stays 0.
+    default seccomp profile  none. Seccomp stays 0.
+  Image check, before each run: `container image inspect "$IMAGE"` passes, and its
+  `.[0].configuration.descriptor.digest` equals the digest in the ref. Else exit 2
+  "image digest mismatch". Reason: `container image tag` accepts a name@sha256 tag for other content.
+  Security warning on each run, on stderr, as a full sentence:
+    "The Apple container runtime has no no-new-privileges, no seccomp filter and no pids cgroup. Use Docker in CI."
+  Build: `container build --platform linux/amd64 --memory "$AI_REVIEW_MEMORY" -f
+  .ai-review/Dockerfile -t ai-review/local:build .ai-review`. Read the digest with the image
+  check jq path. Run `container image tag ai-review/local:build ai-review/local@<digest>`.
+  Write that ref to image.digest. A failed build exits 1: build.sh maps each non-zero to 2.
+  `container build` has no --provenance and no --sbom. build.sh logs "provenance: none".
+  The image is SLSA L0 locally. The publish job (section 9) uses docker buildx only.
 - Capture the exit code: `rc=0; docker run ... || rc=$?`. Stage 1 exits 0 when the build
   ran (a compile error is data for G2 in stage 2) and 2 on infra error. Final = stage 2 code,
   or 2 if stage 1 failed. The host script never changes 0/1/2.
@@ -988,6 +1070,11 @@ agent can read it (no separate file):
   P7: --need scan with gh and cosign missing → exit 0 (scan does not need them).
   P8: no network, a tool missing → no install; plan names the mirror override; exit 2.
   P9: --yes with stub manager → each command printed before it runs; second check passes.
+  P10: AI_REVIEW_RUNTIME=container, macOS 15 → "Apple container needs macOS 26"; exit 2.
+  P11: auto, `docker info` fails, `container system status` passes → "runtime: container",
+       the security warning on stderr.
+  P12: Apple runtime, stub `container image inspect` digest differs from the ref → exit 2,
+       no `container run`.
 - Tamper cases (TRUST MODEL). Each must still report the seeded finding:
   H1: PR adds `.semgrepignore` with `*`, `.gitleaksignore`, `.gitleaks.toml` with no rules,
       `.trivyignore` with the CVE id → all three findings still reported; G3 flags each file.
@@ -1001,6 +1088,8 @@ agent can read it (no separate file):
   H10: PR changes .ai-review/doctor.sh and ai-review.sh to write a marker → in the CI
       template flow, the marker file is absent (only base-branch copies ran).
   H11: tracked lcov.info with 100% → rejected; tests axis `not_evaluated`.
+  H12: run the image on each runtime without --network none → pre-flight exit 2
+       "network not isolated". No scanner runs.
   H5: new `// nosemgrep: rule-id: reason` → result suppressed, listed in
       `suppressions_new`, exit 0. Same comment with no reason → G3 finding, exit 1.
       4 new suppressions with reasons → G3 finding, exit 1.
@@ -1024,6 +1113,11 @@ agent can read it (no separate file):
   R7: per threshold in quality-gate.json and per linter: a fixture at the limit passes,
       a fixture at limit + 1 fails (for example nesting 4 passes, nesting 5 fails). This
       proves the section 4c map. It does not trust the map.
+  R8: Dockerfile build checks (section 1), each a build with one changed input → build fails:
+      BASE_IMAGE without @sha256:; one changed sha256 in tools[]; one changed byte in an npm or
+      pypi lock file; a TARGETARCH with no asset. Plain `docker build .ai-review` with no
+      args passes on amd64 and arm64. Dockerfile BASE_IMAGE default differs from lock
+      base_image → build.sh exits 2. Image with a changed trivy DB byte → pre-flight exit 2.
 
 9) CI INTEGRATION (the tool wires itself into the CI the repo already uses)
 Contract for every CI: fetch base branch → run ./ai-review.sh → read exit code (0/1/2)
@@ -1114,6 +1208,7 @@ Contract for every CI: fetch base branch → run ./ai-review.sh → read exit co
 - --init-ci prints runner requirements: the output of `.ai-review/doctor.sh --need ci --plan`,
   the image ref (AI_REVIEW_IMAGE, else image.digest, else image.ref) and the lock file.
 - Image delivery in CI: pull by digest from the registry, or `docker load` an artifact.
+  CI uses the docker runtime only (section 7 RUNTIME).
   Do not build the image inside the scan job.
 - Branch protection: print (do not apply) these settings:
     the ai-review check is required; 1 approving review; dismiss stale approvals;
